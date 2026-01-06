@@ -4,15 +4,13 @@ import cv2
 import yaml
 import json
 import time
-import sys
 import torch
 import math
 import copy
 import mimetypes
-import logging
 import os
-from typing import List, Tuple, Optional, Union, Dict, Any, Callable
-from transformers import AutoTokenizer
+import sentencepiece as spm
+from typing import List, Optional, Union, Dict, Any, Callable
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -539,10 +537,53 @@ def get_rope_index(input_ids, image_grid_thw, vision_start_token_id, image_token
     position_ids = torch.cat(pos_list, dim=1)
     return position_ids.unsqueeze(1) # [3, 1, L]
 
+class SPTokenizer:
+    def __init__(self, model_dir):
+        self.model_dir = Path(model_dir)
+        self.sp_model_path = self.model_dir / "tokenizer.model"
+        
+        if not self.sp_model_path.exists():
+             raise FileNotFoundError(f"SentencePiece model not found in {model_dir}")
+
+        print("Loading SentencePiece Tokenizer...")
+        self.sp = spm.SentencePieceProcessor(model_file=str(self.sp_model_path))
+        
+        # Load Added Tokens for Decoding
+        self.added_tokens_path = self.model_dir / "added_tokens.json"
+        self.added_tokens_decoder = {}
+        if self.added_tokens_path.exists():
+            with open(self.added_tokens_path, "r", encoding="utf-8") as f:
+                added_tokens = json.load(f)
+                self.added_tokens_decoder = {int(v): k for k, v in added_tokens.items()}
+        
+        # Special Tokens
+        self.bos_token_id = self.sp.bos_id() if self.sp.bos_id() != -1 else 1 # Default to 1 if not set
+        self.eos_token_id = self.sp.eos_id() if self.sp.eos_id() != -1 else 2
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+        if not isinstance(text, str):
+            text = str(text)
+        return self.sp.encode(text)
+
+    def decode(self, token_ids: List[int]) -> str:
+        text = ""
+        current_chunk = []
+        for id in token_ids:
+            if id in self.added_tokens_decoder:
+                if current_chunk:
+                    text += self.sp.decode(current_chunk)
+                    current_chunk = []
+                text += self.added_tokens_decoder[id]
+            else:
+                current_chunk.append(id)
+        if current_chunk:
+            text += self.sp.decode(current_chunk)
+        return text
+
 class PaddleOCRVLPipeline:
     def __init__(self):
         self.core = ov.Core()
-        self.tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR), trust_remote_code=True)
+        self.tokenizer = SPTokenizer(MODEL_DIR)
         
         print("Loading paddleocr-vl-0.9B models...")
         self.vision_patch_embed = self.core.compile_model(f"{MODEL_DIR}/vision_patch_embed.xml", device)
