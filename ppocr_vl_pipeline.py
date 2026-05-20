@@ -14,27 +14,91 @@ from typing import List, Optional, Union, Dict, Any, Callable
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-# Configuration for OCR VL
-WORKING_DIR = "./"
 
-MODEL_DIR = Path(WORKING_DIR,"openvino_ir")
-CONFIG_PATH = f"{MODEL_DIR}/config.json"
-ADDED_TOKENS_PATH = f"{MODEL_DIR}/added_tokens.json"
-device = "CPU"
-# Load Config
-with open(CONFIG_PATH, "r") as f:
-    config = json.load(f)
-# Load Added Tokens
-with open(ADDED_TOKENS_PATH, "r", encoding="utf-8") as f:
-    added_tokens = json.load(f)
+# Paths & pipeline presets
+WORKING_DIR = Path(__file__).resolve().parent
+OV_MODELS_ROOT = WORKING_DIR / "PP-OCR-OV-models"
+DEFAULT_DEVICE = "GPU"
 
-IMAGE_TOKEN_ID = config["image_token_id"]
-VISION_START_TOKEN_ID = config["vision_start_token_id"]
-PATCH_SIZE = config["vision_config"]["patch_size"]
-SPATIAL_MERGE_SIZE = config["vision_config"]["spatial_merge_size"]
-HIDDEN_SIZE = config["hidden_size"]
-VISION_HIDDEN_SIZE = config["vision_config"]["hidden_size"]
-IMAGE_END_TOKEN_ID = added_tokens["<|IMAGE_END|>"]
+PIPELINE_PRESETS = {
+    # PP-DocLayoutV2 + PaddleOCR-VL
+    "v2_vl": {
+        "layout_subdir": "PP-DocLayoutV2-ov",
+        "vl_subdir": "PaddleOCR-VL-ov",
+        "layout_kind": "v2",
+        "title": "PP-DocLayoutV2 + PaddleOCR-VL",
+    },
+    # PP-DocLayoutV3 + PaddleOCR-VL-1.5 (default)
+    "v3_vl15": {
+        "layout_subdir": "PP-DocLayoutV3-ov",
+        "vl_subdir": "PaddleOCR-VL-1.5-ov",
+        "layout_kind": "v3",
+        "title": "PP-DocLayoutV3 + PaddleOCR-VL-1.5",
+    },
+}
+DEFAULT_PIPELINE = "v3_vl15"
+
+
+def load_vl_runtime_config(model_dir: Path) -> dict:
+    model_dir = Path(model_dir)
+    with open(model_dir / "config.json", "r", encoding="utf-8") as f:
+        config = json.load(f)
+    with open(model_dir / "added_tokens.json", "r", encoding="utf-8") as f:
+        added_tokens = json.load(f)
+
+    # Read image normalization from preprocessor_config.json (falls back to VL-1.5 defaults)
+    preproc_path = model_dir / "preprocessor_config.json"
+    image_mean = [0.5, 0.5, 0.5]
+    image_std = [0.5, 0.5, 0.5]
+    if preproc_path.exists():
+        with open(preproc_path, "r", encoding="utf-8") as f:
+            preproc = json.load(f)
+        image_mean = preproc.get("image_mean", image_mean)
+        image_std = preproc.get("image_std", image_std)
+
+    # BOS: try tokenizer.json vocab first, then added_tokens, then fallback to 1
+    bos_chat = added_tokens.get("<|begin_of_sentence|>", None)
+    if bos_chat is None:
+        tok_json_path = model_dir / "tokenizer.json"
+        if tok_json_path.exists():
+            with open(tok_json_path, "r", encoding="utf-8") as f:
+                tok_json = json.load(f)
+            vocab = tok_json.get("model", {}).get("vocab", {})
+            bos_chat = vocab.get("<|begin_of_sentence|>", None)
+            if bos_chat is None:
+                added_vocab = {e["content"]: e["id"] for e in tok_json.get("added_tokens", [])}
+                bos_chat = added_vocab.get("<|begin_of_sentence|>", 1)
+    if bos_chat is None:
+        bos_chat = 1
+    vision_start_token_id = added_tokens.get("<|IMAGE_START|>", config.get("vision_start_token_id"))
+    vision_end_token_id = added_tokens.get("<|IMAGE_END|>", config.get("vision_end_token_id"))
+
+    # Prefix/suffix tokens via SP (plain text, no special tokens needed)
+    import sentencepiece as spm
+    sp_tmp = spm.SentencePieceProcessor(model_file=str(model_dir / "tokenizer.model"))
+    user_prefix_ids = sp_tmp.encode("User: ")         # [2969, 93963, 93919]
+    asst_suffix_ids = sp_tmp.encode("\nAssistant:\n") # [23, 92267, 93963, 23]
+
+    return {
+        "config": config,
+        "added_tokens": added_tokens,
+        "image_token_id": config["image_token_id"],
+        "vision_start_token_id": vision_start_token_id,
+        "vision_end_token_id": vision_end_token_id,
+        "image_end_token_id": vision_end_token_id,   # backward compat alias
+        "patch_size": config["vision_config"]["patch_size"],
+        "spatial_merge_size": config["vision_config"]["spatial_merge_size"],
+        "video_token_id": config["video_token_id"],
+        "image_mean": image_mean,
+        "image_std": image_std,
+        "bos_chat": bos_chat,
+        "user_prefix_ids": user_prefix_ids,
+        "asst_suffix_ids": asst_suffix_ids,
+        # Always use whole-image pipeline (patch-level removed)
+        "is_patch_level": False,
+        "merge_size": 2,
+    }
+
 
 PROMPTS = {
     "ocr": "OCR:",
@@ -430,7 +494,17 @@ def smart_resize(height: int, width: int, factor: int = 28, min_pixels: int = 28
         w_bar = math.ceil(width * beta / factor) * factor
     return h_bar, w_bar
 
-def process_image(image_input):
+def _normalize_image(image: Image.Image, image_mean, image_std) -> np.ndarray:
+    arr = np.array(image).astype(np.float32) / 255.0
+    mean = np.array(image_mean, dtype=np.float32)
+    std = np.array(image_std, dtype=np.float32)
+    return (arr - mean) / std  # HWC
+
+
+def process_image(image_input, patch_size: int, image_mean=None, image_std=None):
+    """VL v1 whole-image preprocessing.
+    Returns pixel_values [1, 3, H, W], grid_thw (1, H//p, W//p).
+    """
     if isinstance(image_input, str):
         image = Image.open(image_input).convert("RGB")
     elif isinstance(image_input, Image.Image):
@@ -441,16 +515,77 @@ def process_image(image_input):
     w, h = image.size
     new_h, new_w = smart_resize(h, w)
     image = image.resize((new_w, new_h), Image.BICUBIC)
-    
-    # Normalize
-    image_np = np.array(image).astype(np.float32) / 255.0
-    mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-    std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
-    image_np = (image_np - mean) / std
-    
-    # Transpose to [C, H, W]
-    image_np = image_np.transpose(2, 0, 1)
-    return torch.tensor(image_np).unsqueeze(0), (1, new_h // PATCH_SIZE, new_w // PATCH_SIZE)
+
+    if image_mean is None:
+        image_mean = [0.48145466, 0.4578275, 0.40821073]  # VL v1: CLIP norm
+    if image_std is None:
+        image_std = [0.26862954, 0.26130258, 0.27577711]
+
+    image_np = _normalize_image(image, image_mean, image_std).transpose(2, 0, 1)
+    return torch.tensor(image_np).unsqueeze(0), (1, new_h // patch_size, new_w // patch_size)
+
+
+def process_image_patches(image_input, patch_size: int, image_mean=None, image_std=None,
+                           merge_size: int = 2):
+    """VL-1.5 patch-level preprocessing.
+    Ensures H and W are divisible by patch_size * merge_size so the 2×2
+    spatial rearrange in _encode_image_v15 always works.
+    Small crops are upscaled so that each dimension spans at least
+    4×patch_size pixels (≥ 2 merge-units), preserving text legibility.
+    Returns:
+        pixel_values  [N_patches, 3, patch_size, patch_size]
+        siglip_pos_ids [N_patches]
+        image_grid_thw  (T=1, H_grid, W_grid)
+    """
+    if isinstance(image_input, str):
+        image = Image.open(image_input).convert("RGB")
+    elif isinstance(image_input, Image.Image):
+        image = image_input.convert("RGB")
+    else:
+        raise ValueError("image_input must be a file path or PIL Image object")
+
+    if image_mean is None:
+        image_mean = [0.5, 0.5, 0.5]
+    if image_std is None:
+        image_std = [0.5, 0.5, 0.5]
+
+    w, h = image.size
+    step = patch_size * merge_size  # 28
+
+    # Minimum grid size: at least 4 patches per side (2 merge-units each side),
+    # so each dimension must be at least 4 * patch_size = 56 px before patchify.
+    # Upscale if the crop is too small to fit enough patches.
+    min_side_px = 4 * patch_size  # 56
+    if h < min_side_px or w < min_side_px:
+        scale = max(min_side_px / h, min_side_px / w)
+        new_h_pre = max(min_side_px, round(h * scale))
+        new_w_pre = max(min_side_px, round(w * scale))
+        image = image.resize((new_w_pre, new_h_pre), Image.BICUBIC)
+        w, h = image.size
+
+    # Resize so both H and W are divisible by step = patch_size * merge_size
+    new_h, new_w = smart_resize(h, w, factor=step)
+    image = image.resize((new_w, new_h), Image.BICUBIC)
+
+    h_grid = new_h // patch_size
+    w_grid = new_w // patch_size
+
+    arr_img = np.array(image).astype(np.float32) / 255.0
+    mean_np = np.array(image_mean, dtype=np.float32)
+    std_np = np.array(image_std, dtype=np.float32)
+    arr_img = (arr_img - mean_np) / std_np  # [H, W, 3]
+
+    patches = arr_img.reshape(h_grid, patch_size, w_grid, patch_size, 3)
+    patches = patches.transpose(0, 2, 4, 1, 3).reshape(-1, 3, patch_size, patch_size)
+
+    N = h_grid * w_grid
+    siglip_pos_ids = np.arange(N, dtype=np.int64) % N
+
+    pixel_values = torch.tensor(patches, dtype=torch.float32)
+    siglip_pos_ids = torch.tensor(siglip_pos_ids, dtype=torch.long)
+    image_grid_thw = (1, h_grid, w_grid)
+
+    return pixel_values, siglip_pos_ids, image_grid_thw
 
 def interpolate_pos_encoding(position_embedding, height, width, patch_size):
     # position_embedding: [NumPositions, Dim]
@@ -473,7 +608,14 @@ def interpolate_pos_encoding(position_embedding, height, width, patch_size):
     patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
     return patch_pos_embed
 
-def get_rope_index(input_ids, image_grid_thw, vision_start_token_id, image_token_id, video_token_id):
+def get_rope_index(
+    input_ids,
+    image_grid_thw,
+    vision_start_token_id,
+    image_token_id,
+    video_token_id,
+    spatial_merge_size: int,
+):
     # Simplified for single image case
     position_ids = torch.ones(3, input_ids.shape[0], input_ids.shape[1], dtype=torch.long)
     
@@ -494,7 +636,7 @@ def get_rope_index(input_ids, image_grid_thw, vision_start_token_id, image_token
     image_tokens_count = input_ids_list.count(image_token_id)
     
     t, h, w = image_grid_thw
-    llm_grid_t, llm_grid_h, llm_grid_w = t, h // SPATIAL_MERGE_SIZE, w // SPATIAL_MERGE_SIZE
+    llm_grid_t, llm_grid_h, llm_grid_w = t, h // spatial_merge_size, w // spatial_merge_size
     
     # Vision part position IDs
     # Time
@@ -581,103 +723,109 @@ class SPTokenizer:
         return text
 
 class PaddleOCRVLPipeline:
-    def __init__(self):
+    def __init__(self, model_dir: Path, device_name: str = DEFAULT_DEVICE):
+        self.model_dir = Path(model_dir)
+        self.device = device_name
+        self.vl = load_vl_runtime_config(self.model_dir)
         self.core = ov.Core()
-        self.tokenizer = SPTokenizer(MODEL_DIR)
-        
-        print("Loading paddleocr-vl-0.9B models...")
-        self.vision_patch_embed = self.core.compile_model(f"{MODEL_DIR}/vision_patch_embed.xml", device)
-        self.vision_encoder = self.core.compile_model(f"{MODEL_DIR}/vision_encoder.xml", device)
-        self.projector_prenorm = self.core.compile_model(f"{MODEL_DIR}/projector_prenorm.xml", device)
-        self.projector_mlp = self.core.compile_model(f"{MODEL_DIR}/projector_mlp.xml", device)
-        self.text_embed = self.core.compile_model(f"{MODEL_DIR}/text_embed.xml", device)
-        self.text_decoder = self.core.compile_model(f"{MODEL_DIR}/text_decoder.xml", device)
-        self.lm_head = self.core.compile_model(f"{MODEL_DIR}/lm_head.xml", device)
-        self.position_embedding = torch.tensor(np.load(f"{MODEL_DIR}/position_embedding.npy"))
-        
-    def encode_image(self, pixel_values, grid_thw):
-        # 1. Patch Embed
-        # pixel_values: [1, 3, H, W]
-        patch_embeds = torch.tensor(self.vision_patch_embed([pixel_values])[0]) # [1, D, H_grid, W_grid]
-        
-        # Flatten and Transpose
-        # [1, D, H, W] -> [1, D, H*W] -> [1, H*W, D]
+        self.tokenizer = SPTokenizer(self.model_dir)
+
+        print(f"Loading VL models from {self.model_dir} ...")
+        md = self.model_dir
+
+        md = self.model_dir
+        self.vision_patch_embed = self.core.compile_model(str(md / "vision_patch_embed.xml"), device_name)
+        self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name)
+        self.projector_prenorm = self.core.compile_model(str(md / "projector_prenorm.xml"), device_name)
+        self.projector_mlp = self.core.compile_model(str(md / "projector_mlp.xml"), device_name)
+        self.text_embed = self.core.compile_model(str(md / "text_embed.xml"), device_name)
+        self.text_decoder = self.core.compile_model(str(md / "text_decoder.xml"), device_name)
+        self.lm_head = self.core.compile_model(str(md / "lm_head.xml"), device_name)
+        self.position_embedding = torch.tensor(np.load(md / "position_embedding.npy"))
+        self.patch_size = self.vl["patch_size"]
+        self.spatial_merge_size = self.vl["spatial_merge_size"]
+        self.image_mean = self.vl["image_mean"]
+        self.image_std = self.vl["image_std"]
+        print("  Vision pipeline: whole-image")
+
+    def _encode_image_v1(self, pixel_values, grid_thw):
+        """Whole-image encode path (used by both VL v1 and VL-1.5)."""
+        patch_embeds = torch.tensor(self.vision_patch_embed([pixel_values])[0])
         B, D, H, W = patch_embeds.shape
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)
-        
-        # 2. Add Position Embeddings
+        embeddings = patch_embeds.flatten(2).transpose(1, 2)  # [1, H*W, D]
+
         t, h, w = grid_thw
-        # Interpolate pos embed to (h, w)
-        pos_embed = interpolate_pos_encoding(self.position_embedding, h, w, PATCH_SIZE)
+        pos_embed = interpolate_pos_encoding(self.position_embedding, h, w, self.patch_size)
         embeddings = embeddings + pos_embed
-        
-        # Calculate RoPE IDs for Vision Encoder
+
         image_pids = torch.arange(t * h * w) % (h * w)
         height_position_ids = image_pids // w
         width_position_ids = image_pids % w
-        
-        # 3. Vision Encoder
-        # Inputs: hidden_states, height_position_ids, width_position_ids
-        hidden_states = torch.tensor(self.vision_encoder([embeddings, height_position_ids, width_position_ids])[0]) # [1, SeqLen, 1152]
-        
-        # 4. Projector PreNorm
+
+        hidden_states = torch.tensor(
+            self.vision_encoder([embeddings, height_position_ids, width_position_ids])[0]
+        )  # [1, N, D]
+
         hidden_states = torch.tensor(self.projector_prenorm([hidden_states])[0])
-        
-        # 5. Spatial Merge (Rearrange)
-        # Input: [1, H*W, D]
-        # Target: Merge 2x2 patches
-        # Reshape to [1, H, W, D]
-        hidden_states = hidden_states.view(1, h, w, -1)
-        
-        # Rearrange: (h p1) (w p2) d -> h w (p1 p2 d)
-        # h_new = h // 2, w_new = w // 2
-        p1 = p2 = SPATIAL_MERGE_SIZE
+
+        p1 = p2 = self.spatial_merge_size
         h_new = h // p1
         w_new = w // p2
-        
         hidden_states = hidden_states.view(1, h_new, p1, w_new, p2, -1)
-        hidden_states = hidden_states.permute(0, 1, 3, 2, 4, 5) # [1, h_new, w_new, p1, p2, D]
+        hidden_states = hidden_states.permute(0, 1, 3, 2, 4, 5)
         hidden_states = hidden_states.reshape(1, h_new * w_new, p1 * p2 * hidden_states.shape[-1])
-        
-        # 6. Projector MLP
-        image_embeds = torch.tensor(self.projector_mlp([hidden_states])[0]) # [1, SeqLen_New, 1024]
-       
-        return image_embeds[0] # Return [SeqLen, 1024]
 
+        image_embeds = torch.tensor(self.projector_mlp([hidden_states])[0])
+        return image_embeds[0]  # [SeqLen, D_text]
+
+    def encode_image(self, pixel_values, grid_thw=None, **_):
+        return self._encode_image_v1(pixel_values, grid_thw)
     def generate(self, image_path, task="ocr"):
         prompt = PROMPTS[task]
-        # 1. Process Image
-        pixel_values, grid_thw = process_image(image_path)
-        image_embeds = self.encode_image(pixel_values, grid_thw)
-        
-        # 2. Prepare Input IDs
-        # Construct prompt with placeholders
-        # We need to insert `image_token_id` repeated N times
+        cfg = self.vl["config"]
+        # 1. Process Image (whole-image path for both VL v1 and VL-1.5)
+        pixel_values, grid_thw = process_image(
+            image_path, self.patch_size,
+            image_mean=self.image_mean, image_std=self.image_std,
+        )
+        image_embeds = self.encode_image(pixel_values, grid_thw=grid_thw)
+        image_grid_thw = grid_thw
+
+        # 2. Prepare Input IDs using official chat template structure:
+        #    <BOS> User: <IMAGE_START> <IMAGE*N> <IMAGE_END> OCR:\nAssistant:\n
         num_image_tokens = image_embeds.shape[0]
-        
-        # Chat Template Construction
-        # Format: <s>User: <|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>Prompt\nAssistant: 
-        
-        BOS_TOKEN_ID = self.tokenizer.bos_token_id
-        prefix_ids = [BOS_TOKEN_ID] + self.tokenizer.encode(prompt, add_special_tokens=False)
-        suffix_ids = [IMAGE_END_TOKEN_ID] + self.tokenizer.encode(prompt, add_special_tokens=False)
-        
-        # Construct full input_ids
-        # [BOS, User:, VISION_START, ImageToken * N, IMAGE_END, Prompt, \n, Assistant: ]
-        input_ids = prefix_ids + [VISION_START_TOKEN_ID] + [IMAGE_TOKEN_ID] * num_image_tokens + suffix_ids
-        
+        image_token_id = self.vl["image_token_id"]
+        vision_start_token_id = self.vl["vision_start_token_id"]
+        vision_end_token_id = self.vl["vision_end_token_id"]
+
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        input_ids = (
+            [self.vl["bos_chat"]]                   # <|begin_of_sentence|>
+            + self.vl["user_prefix_ids"]             # User: (space)
+            + [vision_start_token_id]               # <|IMAGE_START|>
+            + [image_token_id] * num_image_tokens   # <|IMAGE_PLACEHOLDER|> × N (expanded)
+            + [vision_end_token_id]                 # <|IMAGE_END|>
+            + prompt_ids                             # OCR:  (or Table Recognition: etc.)
+            + self.vl["asst_suffix_ids"]             # \nAssistant:\n
+        )
         input_ids = torch.tensor([input_ids], dtype=torch.long)
         
         # 3. Text Embeddings
         inputs_embeds = torch.tensor(self.text_embed([input_ids])[0])
         
         # 4. Replace Image Embeddings
-        # Find indices of image tokens
-        image_mask = (input_ids == IMAGE_TOKEN_ID)
+        image_mask = (input_ids == image_token_id)
         inputs_embeds[image_mask] = image_embeds
         
         # 5. Position IDs (RoPE)
-        position_ids = get_rope_index(input_ids, grid_thw, VISION_START_TOKEN_ID, IMAGE_TOKEN_ID, config["video_token_id"])
+        position_ids = get_rope_index(
+            input_ids,
+            image_grid_thw,
+            vision_start_token_id,
+            image_token_id,
+            self.vl["video_token_id"],
+            self.spatial_merge_size,
+        )
         
         # print(f"Position IDs shape: {position_ids.shape}")
         # print(f"Position IDs[:, :, :10]: {position_ids[:, :, :10]}")
@@ -685,118 +833,164 @@ class PaddleOCRVLPipeline:
         
         # 6. Generation Loop
         past_key_values = []
-        num_layers = config["num_hidden_layers"]
-        num_kv_heads = config.get("num_key_value_heads", config["num_attention_heads"])
-        head_dim = config["head_dim"]
-        
+        num_layers = cfg["num_hidden_layers"]
+        num_kv_heads = cfg.get("num_key_value_heads", cfg["num_attention_heads"])
+        head_dim = cfg["head_dim"]
+
         # Initialize empty past_key_values
         for _ in range(num_layers):
             k = torch.zeros(1, num_kv_heads, 0, head_dim)
             v = torch.zeros(1, num_kv_heads, 0, head_dim)
             past_key_values.extend([k, v])
-            
+
         generated_ids = []
-        
-        # print("Starting generation...")
         start_time = time.time()
-        
         infer_request = self.text_decoder.create_infer_request()
-        
-        # Increase max new tokens to support paragraphs
-        max_new_tokens = 2048 
-        for i in range(max_new_tokens): 
-            # Prepare inputs
-            # For first step, use full sequence. For subsequent, use last token.
+
+        # Per-task token limits
+        _TASK_MAX_TOKENS = {
+            "ocr": 768,
+            "table": 1024,
+            "formula": 256,
+            "chart": 512,
+        }
+        max_new_tokens = _TASK_MAX_TOKENS.get(task, 512)
+        _SINGLE_WIN = 6  # identical single-token streak
+
+        def _is_repeating(ids: list, min_win: int = 2, max_win: int = 60,
+                           min_reps: int = 2) -> bool:
+            """Return True if the tail of `ids` contains a repeated n-gram."""
+            n = len(ids)
+            for win in range(min_win, min(max_win + 1, n // min_reps + 1)):
+                need = win * min_reps
+                if n < need:
+                    continue
+                tail = ids[-need:]
+                ngram = tuple(tail[:win])
+                if all(tuple(tail[j: j + win]) == ngram
+                       for j in range(0, need, win)):
+                    return True
+            return False
+
+        for i in range(max_new_tokens):
             if i == 0:
                 curr_inputs_embeds = inputs_embeds
                 curr_position_ids = position_ids
                 curr_attention_mask = torch.ones(1, inputs_embeds.shape[1], dtype=torch.long)
             else:
                 curr_inputs_embeds = next_token_embed
-                # Update position_ids for next token
-                # We need to increment the last position
-                # Simplified: just increment the last value of position_ids
-                # But position_ids is [3, 1, L].
-                # For next token, we need [3, 1, 1]
                 last_pos = position_ids[:, :, -1:] + 1
                 curr_position_ids = last_pos
                 position_ids = torch.cat([position_ids, last_pos], dim=2)
-                
                 curr_attention_mask = torch.ones(1, position_ids.shape[2], dtype=torch.long)
-            
-            # Run Decoder
-            # Inputs: inputs_embeds, attention_mask, position_ids, *past_key_values
+
             inputs = [curr_inputs_embeds, curr_attention_mask, curr_position_ids] + past_key_values
-            
-            # Set inputs using index to ensure order
             for idx, input_tensor in enumerate(inputs):
                 infer_request.set_input_tensor(idx, ov.Tensor(input_tensor.detach().numpy()))
-            
+
             infer_request.infer()
-            
-            # Get outputs
-            # Output 0: hidden_states
-            # Output 1..N: new_past_key_values
+
             hidden_states = torch.tensor(infer_request.get_output_tensor(0).data)
-            
-            # Update past_key_values
+
             new_past = []
             for idx in range(1, len(self.text_decoder.outputs)):
                 new_past.append(torch.tensor(infer_request.get_output_tensor(idx).data))
             past_key_values = new_past
-            
-            # Run LM Head
+
             logits = torch.tensor(self.lm_head([hidden_states[:, -1:, :]])[0])
-            
-            # Greedy decode
             next_token_id = torch.argmax(logits, dim=-1).item()
             generated_ids.append(next_token_id)
-            # print(self.tokenizer.decode([next_token_id]), end="", flush=True)
-            
+
             if next_token_id == self.tokenizer.eos_token_id:
                 break
-                
-            # Prepare embedding for next step
+
+            # Repetition guard 1: identical single-token streak
+            if len(generated_ids) >= _SINGLE_WIN and len(set(generated_ids[-_SINGLE_WIN:])) == 1:
+                break
+
+            # Repetition guard 2: repeated n-gram of any length 2–60
+            if _is_repeating(generated_ids):
+                # trim to first occurrence of the repeated block
+                n = len(generated_ids)
+                for win in range(2, min(61, n // 2 + 1)):
+                    need = win * 2
+                    if n >= need:
+                        tail = generated_ids[-need:]
+                        ngram = tuple(tail[:win])
+                        if all(tuple(tail[j: j + win]) == ngram
+                               for j in range(0, need, win)):
+                            generated_ids = generated_ids[:-win]
+                            break
+                break
+
             next_token_tensor = torch.tensor([[next_token_id]], dtype=torch.long)
             next_token_embed = torch.tensor(self.text_embed([next_token_tensor])[0])
-            
-        # print(f"\nGeneration complete. Time: {time.time() - start_time:.2f}s")
-        return self.tokenizer.decode(generated_ids)
 
-class PPDocLayoutPipeline:
-    def __init__(self):
-        self.model_dir = Path(MODEL_DIR,"PP-DocLayoutV2")
-        self.model_path = self.model_dir / "inference_fixed.xml"
+        text = self.tokenizer.decode(generated_ids)
+        # Strip leading whitespace / newlines produced by the prompt prefix
+        return text.lstrip(" \n\r")
+
+def _layout_nms(boxes: list, iou_thresh: float = 0.5, io_min_thresh: float = 0.8) -> list:
+    if not boxes:
+        return boxes
+    boxes.sort(key=lambda x: x["score"], reverse=True)
+    keep_boxes = []
+    for box in boxes:
+        x1, y1, x2, y2 = box["bbox"]
+        area = (x2 - x1) * (y2 - y1)
+        discard = False
+        for kept_box in keep_boxes:
+            kx1, ky1, kx2, ky2 = kept_box["bbox"]
+            k_area = (kx2 - kx1) * (ky2 - ky1)
+            ix1 = max(x1, kx1)
+            iy1 = max(y1, ky1)
+            ix2 = min(x2, kx2)
+            iy2 = min(y2, ky2)
+            inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union_area = area + k_area - inter_area
+            iou = inter_area / union_area if union_area > 0 else 0
+            io_min = inter_area / min(area, k_area) if min(area, k_area) > 0 else 0
+            if iou > iou_thresh or io_min > io_min_thresh:
+                discard = True
+                break
+        if not discard:
+            keep_boxes.append(box)
+    return keep_boxes
+
+
+class PPDocLayoutV2Pipeline:
+    def __init__(self, model_dir: Path, device_name: str = DEFAULT_DEVICE, verbose: bool = False):
+        self.model_dir = Path(model_dir)
+        self.model_path = self.model_dir / "inference.xml"
         self.config_path = self.model_dir / "inference.yml"
-        self.device = device
-        
+        self.device = device_name
+        self.verbose = verbose
+
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
         if not self.config_path.exists():
             raise FileNotFoundError(f"Config not found: {self.config_path}")
 
-        # Load Config
-        with open(self.config_path, 'r', encoding='utf-8') as f:
+        with open(self.config_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f)
-            
-        # Load Labels from config.json
+
         self.config_json_path = self.model_dir / "config.json"
         self.labels = []
         if self.config_json_path.exists():
-            with open(self.config_json_path, 'r', encoding='utf-8') as f:
+            with open(self.config_json_path, "r", encoding="utf-8") as f:
                 json_config = json.load(f)
                 self.labels = json_config.get("label_list", [])
         else:
             print(f"Warning: {self.config_json_path} not found. Class names will be unavailable.")
-        
-        self.draw_threshold = self.config.get('draw_threshold', 0.5)
-        
-        # Initialize OpenVINO
+
+        self.draw_threshold = self.config.get("draw_threshold", 0.5)
+
         self.core = ov.Core()
-        print(f"[Layout] Reading model from {self.model_path}...")
-        self.model = self.core.read_model(model=str(self.model_path))
-        print(f"[Layout] Compiling model on {self.device}...")
-        self.compiled_model = self.core.compile_model(self.model, device_name=self.device)
+        print(f"[Layout V2] {self.model_path}")
+        self.compiled_model = self.core.compile_model(
+            self.core.read_model(model=str(self.model_path)),
+            device_name=self.device,
+        )
 
     def preprocess(self, image):
         # image: cv2 image (BGR)
@@ -833,127 +1027,219 @@ class PPDocLayoutPipeline:
             img = image_path
         else:
             raise ValueError("Input must be path or numpy array")
-            
+
         if img is None:
             raise ValueError("Failed to load image")
 
         img_batch, im_shape, scale_factor = self.preprocess(img)
-        
-        inputs = {
-            "image": img_batch,
-            "im_shape": im_shape,
-            "scale_factor": scale_factor
-        }
-        
-        results = self.compiled_model(inputs)
-        
-        # Parse results
-        # Output is usually a list of boxes: [Class, Score, X1, Y1, X2, Y2]
-        # We need to find the correct output node
+        results = self.compiled_model(
+            {"image": img_batch, "im_shape": im_shape, "scale_factor": scale_factor}
+        )
+
         boxes = []
-        
-        print("\n[Layout Debug] Raw Outputs:")
+        if self.verbose:
+            print("\n[Layout V2] Raw outputs:")
         for output_node, output_data in results.items():
-            print(f"  Node: {output_node.any_name}, Shape: {output_data.shape}")
-            # Heuristic to find the box output (usually shape [N, 6] or [N, 8])
-            if len(output_data.shape) == 2 and (output_data.shape[1] == 6 or output_data.shape[1] == 8):
+            if self.verbose:
+                print(f"  {output_node.any_name}: {output_data.shape}")
+            if len(output_data.shape) == 2 and output_data.shape[1] in (6, 8):
                 for row in output_data:
-                    print("row: ", row)
                     class_id = int(row[0])
-                    score = row[1]
+                    score = float(row[1])
                     if score > self.draw_threshold:
                         x1, y1, x2, y2 = row[2:6]
-                        
-                        # Extract reading order if available (index 6)
-                        reading_order = 0
-                        if output_data.shape[1] == 8:
-                            reading_order = int(row[6])
-                            
-                        boxes.append({
-                            "class_id": class_id,
-                            "score": score,
-                            "bbox": [x1, y1, x2, y2],
-                            "reading_order": reading_order
-                        })
-        
-        # Apply NMS (Non-Maximum Suppression) to filter overlapping boxes
-        if len(boxes) > 0:
-            # Sort by score descending
-            boxes.sort(key=lambda x: x["score"], reverse=True)
-            
-            keep_boxes = []
-            
-            for i, box in enumerate(boxes):
-                x1, y1, x2, y2 = box["bbox"]
-                area = (x2 - x1) * (y2 - y1)
-                
-                discard = False
-                for kept_box in keep_boxes:
-                    kx1, ky1, kx2, ky2 = kept_box["bbox"]
-                    k_area = (kx2 - kx1) * (ky2 - ky1)
-                    
-                    # Calculate Intersection
-                    ix1 = max(x1, kx1)
-                    iy1 = max(y1, ky1)
-                    ix2 = min(x2, kx2)
-                    iy2 = min(y2, ky2)
-                    
-                    inter_w = max(0, ix2 - ix1)
-                    inter_h = max(0, iy2 - iy1)
-                    inter_area = inter_w * inter_h
-                    
-                    # Calculate Union
-                    union_area = area + k_area - inter_area
-                    
-                    # IoU (Intersection over Union) - Standard NMS
-                    iou = inter_area / union_area if union_area > 0 else 0
-                    
-                    # IoMin (Intersection over Minimum Area) - Handles "Box1 inside Box2"
-                    # If the smaller box is > 80% covered by the larger one, suppress it
-                    io_min = inter_area / min(area, k_area) if min(area, k_area) > 0 else 0
-                    
-                    if iou > 0.5 or io_min > 0.8:
-                        discard = True
-                        break
-                
-                if not discard:
-                    keep_boxes.append(box)
-            
-            boxes = keep_boxes
+                        reading_order = int(row[6]) if output_data.shape[1] == 8 else 0
+                        boxes.append(
+                            {
+                                "class_id": class_id,
+                                "score": score,
+                                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                                "reading_order": reading_order,
+                            }
+                        )
 
-        return boxes, img
+        return _layout_nms(boxes), img
 
-def main():
-    # Configuration
-    IMAGE_PATH = Path(WORKING_DIR,"test.png")
-    
-    # 1. Initialize Stage 1: Layout Analysis
-    print("=== Initializing Stage 1: Layout Analysis ===")
-    try:
-        layout_pipeline = PPDocLayoutPipeline()
-    except Exception as e:
-        print(f"Failed to init Layout Pipeline: {e}")
-        return
 
-    # 2. Initialize Stage 2: OCR VL
-    print("\n=== Initializing Stage 2: OCR VL ===")
-    try:
-        ocr_pipeline = PaddleOCRVLPipeline()
-    except Exception as e:
-        print(f"Failed to init OCR Pipeline: {e}")
-        return
+class PPDocLayoutV3Pipeline:
+    """PP-DocLayoutV3 OpenVINO (safetensors export) + HF ImageProcessor post-process."""
 
-    # 3. Run Pipeline
-    print(f"\n=== Processing Image: {IMAGE_PATH} ===")
+    def __init__(self, model_dir: Path, device_name: str = DEFAULT_DEVICE):
+        self.model_dir = Path(model_dir)
+        self.model_path = self.model_dir / "inference.xml"
+        self.device = device_name
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model not found: {self.model_path}")
+
+        with open(self.model_dir / "config.json", "r", encoding="utf-8") as f:
+            layout_cfg = json.load(f)
+        self.id2label = {int(k): v for k, v in layout_cfg.get("id2label", {}).items()}
+        # Use 0.3 to match Paddle's detection threshold (Paddle outputs boxes ~0.36+)
+        self.draw_threshold = 0.3
+
+        self._image_processor = None
+        try:
+            from transformers import AutoImageProcessor
+
+            self._image_processor = AutoImageProcessor.from_pretrained(str(self.model_dir))
+        except Exception as exc:
+            raise RuntimeError(
+                "PP-DocLayoutV3 需要 transformers>=5.8.1 且能加载 PPDocLayoutV3ImageProcessor。"
+                f" 原始错误: {exc}"
+            ) from exc
+
+        self.core = ov.Core()
+        print(f"[Layout V3] {self.model_path}")
+        self.compiled_model = self.core.compile_model(
+            self.core.read_model(model=str(self.model_path)),
+            device_name=self.device,
+        )
+        self._out_names = [o.get_any_name() for o in self.compiled_model.outputs]
+
+    def predict(self, image_path):
+        if isinstance(image_path, str):
+            img_bgr = cv2.imread(image_path)
+        elif isinstance(image_path, np.ndarray):
+            img_bgr = image_path
+        else:
+            raise ValueError("Input must be path or numpy array")
+        if img_bgr is None:
+            raise ValueError("Failed to load image")
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(img_rgb)
+        orig_h, orig_w = img_bgr.shape[:2]
+
+        proc_inputs = self._image_processor(images=pil_image, return_tensors="pt")
+        pixel_values = proc_inputs["pixel_values"].numpy()
+
+        ov_out = self.compiled_model(pixel_values)
+        out_list = list(ov_out.values()) if hasattr(ov_out, "values") else [ov_out]
+        tensors = {}
+        for i, out_port in enumerate(self.compiled_model.outputs):
+            name = out_port.get_any_name() or self._out_names[i]
+            tensors[name] = out_list[i]
+
+        from types import SimpleNamespace
+
+        outputs = SimpleNamespace(
+            pred_boxes=torch.tensor(tensors["pred_boxes"]),
+            logits=torch.tensor(tensors["logits"]),
+            order_logits=torch.tensor(tensors["order_logits"]),
+            out_masks=torch.tensor(tensors["out_masks"]),
+        )
+        target_sizes = torch.tensor([[orig_h, orig_w]])
+        processed = self._image_processor.post_process_object_detection(
+            outputs,
+            threshold=self.draw_threshold,
+            target_sizes=target_sizes,
+        )[0]
+
+        boxes = []
+        scores = processed["scores"].tolist()
+        labels = processed["labels"].tolist()
+        bboxes = processed["boxes"].tolist()
+        polygon_points = processed.get("polygon_points", [None] * len(scores))
+
+        for order_idx, (score, label_id, bbox, poly) in enumerate(
+            zip(scores, labels, bboxes, polygon_points)
+        ):
+            x1, y1, x2, y2 = bbox
+            boxes.append(
+                {
+                    "class_id": int(label_id),
+                    "score": float(score),
+                    "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                    "reading_order": order_idx,
+                    "polygon_points": poly,
+                }
+            )
+
+        # Cross-class NMS: remove lower-score boxes that heavily overlap a higher-score box
+        return _layout_nms(boxes, iou_thresh=0.5, io_min_thresh=0.7), img_bgr
+
+    def label_name(self, class_id: int) -> str:
+        return self.id2label.get(class_id, f"Class_{class_id}")
+
+
+def create_layout_pipeline(layout_kind: str, model_dir: Path, device: str, verbose: bool = False):
+    if layout_kind == "v2":
+        return PPDocLayoutV2Pipeline(model_dir, device_name=device, verbose=verbose)
+    if layout_kind == "v3":
+        return PPDocLayoutV3Pipeline(model_dir, device_name=device)
+    raise ValueError(f"Unknown layout_kind: {layout_kind}")
+
+
+def layout_class_name(layout_pipeline, class_id: int) -> str:
+    if hasattr(layout_pipeline, "label_name"):
+        return layout_pipeline.label_name(class_id)
+    labels = getattr(layout_pipeline, "labels", [])
+    if 0 <= class_id < len(labels):
+        return labels[class_id]
+    return f"Class_{class_id}"
+
+
+def build_pipelines(
+    pipeline_name: str = DEFAULT_PIPELINE,
+    ov_root: Path = OV_MODELS_ROOT,
+    device: str = DEFAULT_DEVICE,
+    verbose_layout: bool = False,
+):
+    if pipeline_name not in PIPELINE_PRESETS:
+        raise ValueError(
+            f"Unknown pipeline '{pipeline_name}'. Choose from: {list(PIPELINE_PRESETS)}"
+        )
+    preset = PIPELINE_PRESETS[pipeline_name]
+    layout_dir = ov_root / preset["layout_subdir"]
+    vl_dir = ov_root / preset["vl_subdir"]
+    layout = create_layout_pipeline(
+        preset["layout_kind"], layout_dir, device, verbose=verbose_layout
+    )
+    ocr = PaddleOCRVLPipeline(vl_dir, device_name=device)
+    return layout, ocr, preset
+
+
+def run_end_to_end(
+    image_path: Path,
+    pipeline_name: str = DEFAULT_PIPELINE,
+    ov_root: Path = OV_MODELS_ROOT,
+    device: str = DEFAULT_DEVICE,
+    verbose_layout: bool = False,
+    layout_threshold: float = None,
+    debug: bool = False,
+    # Pre-built pipelines; if provided, model loading is skipped
+    layout_pipeline=None,
+    ocr_pipeline=None,
+):
+    preset = PIPELINE_PRESETS[pipeline_name]
+    if layout_pipeline is None or ocr_pipeline is None:
+        print(f"=== Pipeline: {preset['title']} ({pipeline_name}) ===")
+        layout_pipeline = create_layout_pipeline(
+            preset["layout_kind"],
+            ov_root / preset["layout_subdir"],
+            device,
+            verbose=verbose_layout,
+        )
+        # Override threshold if explicitly specified
+        if layout_threshold is not None:
+            layout_pipeline.draw_threshold = layout_threshold
+            print(f"  Layout threshold overridden to {layout_threshold}")
+        ocr_pipeline = PaddleOCRVLPipeline(ov_root / preset["vl_subdir"], device_name=device)
+    else:
+        # Still apply threshold override when reusing pipelines
+        if layout_threshold is not None:
+            layout_pipeline.draw_threshold = layout_threshold
+    if debug:
+        print(f"\n=== Processing Image: {image_path.name if hasattr(image_path, 'name') else image_path} ===")
     
     total_start_time = time.time()
     
     # Step 0: Load Image
     img_load_start = time.time()
-    if isinstance(IMAGE_PATH, (str, Path)):
-        original_img_cv2 = cv2.imread(str(IMAGE_PATH))
+    if isinstance(image_path, (str, Path)):
+        original_img_cv2 = cv2.imread(str(image_path))
     else:
-        original_img_cv2 = IMAGE_PATH
+        original_img_cv2 = image_path
     img_load_end = time.time()
     image_process_time = img_load_end - img_load_start
     
@@ -963,39 +1249,35 @@ def main():
     det_end = time.time()
     detection_time = det_end - det_start
     
-    print(f"Layout Analysis finished in {detection_time:.2f}s")
-    print(f"Found {len(layout_results)} regions.")
+    if debug:
+        print(f"Layout Analysis finished in {detection_time:.2f}s")
+        print(f"Found {len(layout_results)} regions.")
     
     # Convert CV2 image to PIL for cropping
     original_img_pil = Image.fromarray(cv2.cvtColor(original_img_cv2, cv2.COLOR_BGR2RGB))
     
     # Step 2: Process each region (Recognition)
-    print("\n=== Running Recognition on Regions ===")
+    if debug:
+        print("\n=== Running Recognition on Regions ===")
     
     rec_start = time.time()
     
-    # Use the order from the model prediction (it implies reading order)
-    # layout_results.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
-    
-    # Sort by reading_order if available
     layout_results.sort(key=lambda x: x.get("reading_order", 0))
     
     parsing_res_list = []
     
     for i, res in enumerate(layout_results):
-        print("res:", res)
-        bbox = res["bbox"] # x1, y1, x2, y2
+        if debug:
+            print("res:", res)
+        bbox = res["bbox"]
         score = res["score"]
         class_id = res["class_id"]
         
+        class_name = layout_class_name(layout_pipeline, class_id)
         
-        if 0 <= class_id < len(layout_pipeline.labels):
-            class_name = layout_pipeline.labels[class_id]
-        else:
-            class_name = f"Class_{class_id}"
-        
-        print(f"\n--- Region {i+1}/{len(layout_results)}: {class_name} (Score: {score:.2f}) ---")
-        print(f"Box: {bbox}")
+        if debug:
+            print(f"\n--- Region {i+1}/{len(layout_results)}: {class_name} (Score: {score:.2f}) ---")
+            print(f"Box: {bbox}")
         
         # Crop
         # Ensure coordinates are within bounds
@@ -1008,31 +1290,40 @@ def main():
         y2 = min(h, int(bbox[3]) + padding)
         
         if x2 <= x1 or y2 <= y1:
-            print("Invalid crop dimensions, skipping.")
+            if debug:
+                print("Invalid crop dimensions, skipping.")
             continue
             
         crop_img = original_img_pil.crop((x1, y1, x2, y2))
         
-        # Run OCR VL
-        # Determine task based on class? 
-        # For now, use 'ocr' for everything, or 'table' for tables.
+        SKIP_CLASSES = {"image", "figure", "figure_caption", "header_image", "footer_image"}
+        if class_name in SKIP_CLASSES:
+            if debug:
+                print(f"Detection class_name:{class_name}, skipping VL recognition")
+            parsing_res_list.append({
+                "block_label": class_name,
+                "block_content": "",
+                "block_bbox": [x1, y1, x2, y2],
+                "block_id": i,
+                "block_order": None,
+            })
+            continue
+
         task = "ocr"
         if class_name == "table":
             task = "table"
-        elif class_name == "figure" or class_name == "chart":
-            task = "chart" # Assuming figure might be a chart
-        elif class_name == "display_formula" or class_name == "inline_formula":
+        elif class_name == "chart":
+            task = "chart"
+        elif class_name in ("display_formula", "inline_formula", "formula"):
             task = "formula"
-        elif class_name == "image":
-            # continue # Default to skip for images
-            pass
-            
-        print(f"Detection class_name:{class_name}, Task: {task}")
+
+        if debug:
+            print(f"Detection class_name:{class_name}, Task: {task}")
         result_text = ""
         try:
-            # Pass the PIL Image object directly
             result_text = ocr_pipeline.generate(crop_img, task=task)
-            print(f"Result:\n{result_text}")
+            if debug:
+                print(f"Result:\n{result_text}")
         except Exception as e:
             print(f"Recognition failed: {e}")
             
@@ -1050,16 +1341,17 @@ def main():
     total_end_time = time.time()
     total_time = total_end_time - total_start_time
 
-    print("\n=== Pipeline Complete ===")
-    print(f"\n[Time Statistics]")
-    print(f"Image Load Time: {image_process_time:.4f}s")
-    print(f"Detection Time : {detection_time:.4f}s")
-    print(f"Recognition Time: {recognition_time:.4f}s")
-    print(f"Total Time     : {total_time:.4f}s")
+    if debug:
+        print("\n=== Pipeline Complete ===")
+        print(f"\n[Time Statistics]")
+        print(f"Image Load Time: {image_process_time:.4f}s")
+        print(f"Detection Time : {detection_time:.4f}s")
+        print(f"Recognition Time: {recognition_time:.4f}s")
+        print(f"Total Time     : {total_time:.4f}s")
     
     # Save Results using OCRResult class
     ocr_result = OCRResult({
-        "input_path": str(IMAGE_PATH),
+        "input_path": str(image_path),
         "page_index": None,
         "model_settings": {
             "use_doc_preprocessor": False,
@@ -1073,7 +1365,7 @@ def main():
             "boxes": [
                 {
                     "cls_id": res["class_id"],
-                    "label": layout_pipeline.labels[res["class_id"]] if 0 <= res["class_id"] < len(layout_pipeline.labels) else "unknown",
+                    "label": layout_class_name(layout_pipeline, res["class_id"]),
                     "score": res["score"],
                     "coordinate": res["bbox"]
                 }
@@ -1083,24 +1375,154 @@ def main():
         "parsing_res_list": parsing_res_list
     }, original_img=original_img_pil)
     
-    output_dir = Path(WORKING_DIR) / "output"
+    output_dir = WORKING_DIR / "output"
     output_dir.mkdir(exist_ok=True)
-    
     # Save JSON
     ocr_result.save_to_json(str(output_dir))
-    print(f"Saved JSON result to {output_dir}")
+    if debug:
+        print(f"Saved JSON result to {output_dir}")
     
     # Save Markdown
     ocr_result.save_to_markdown(str(output_dir))
-    print(f"Saved Markdown result to {output_dir}")
+    if debug:
+        print(f"Saved Markdown result to {output_dir}")
     
     # Save save_to_img (Visualization of layout)
     ocr_result.save_to_img(save_path=str(output_dir / "vis_layout.jpg"))
-    print(f"Saved detection result to {output_dir}")
-    ocr_result.print()
+    if debug:
+        print(f"Saved detection result to {output_dir}")
+        ocr_result.print()
+    return ocr_result, total_time
 
-    # Save Image (Visualization - optional, currently just saves original)
-    # ocr_result.save_to_img(str(output_dir))
+
+def main():
+    import argparse
+
+    SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+
+    parser = argparse.ArgumentParser(description="PaddleOCR-VL OpenVINO end-to-end pipeline")
+    parser.add_argument(
+        "--pipeline",
+        choices=list(PIPELINE_PRESETS.keys()),
+        default=DEFAULT_PIPELINE,
+        help=f"Pipeline preset (default: {DEFAULT_PIPELINE})",
+    )
+    parser.add_argument(
+        "--image",
+        type=Path,
+        default=WORKING_DIR / "test.png",
+        help="Input image path or folder",
+    )
+    parser.add_argument(
+        "--ov-root",
+        type=Path,
+        default=OV_MODELS_ROOT,
+        help="Root directory of OpenVINO IR models (PP-OCR-OV-models)",
+    )
+    parser.add_argument("--device", default=DEFAULT_DEVICE, help="OpenVINO device, e.g. CPU")
+    parser.add_argument(
+        "--layout-threshold",
+        type=float,
+        default=None,
+        help="Layout detection score threshold (default: 0.5 for V2, 0.3 for V3)",
+    )
+    parser.add_argument(
+        "--verbose-layout",
+        action="store_true",
+        help="Print raw layout model outputs (V2)",
+    )
+    parser.add_argument(
+        "--debug",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Debug verbosity: 0=quiet (default), 1=print per-region logs",
+    )
+    args = parser.parse_args()
+
+    input_path = args.image.resolve()
+
+    # Collect image files
+    if input_path.is_dir():
+        image_files = sorted(
+            p for p in input_path.iterdir()
+            if p.suffix.lower() in SUPPORTED_EXTS
+        )
+        if not image_files:
+            print(f"No supported images found in {input_path}")
+            return
+        print(f"Found {len(image_files)} image(s) in {input_path}")
+    elif input_path.is_file():
+        image_files = [input_path]
+    else:
+        print(f"Path not found: {input_path}")
+        return
+
+    # ── Load models ONCE before the loop ────────────────────────────────────
+    preset = PIPELINE_PRESETS[args.pipeline]
+    ov_root = args.ov_root
+    print(f"\n=== Pipeline: {preset['title']} ({args.pipeline}) ===")
+    print("Loading models (once)...")
+    model_load_start = time.time()
+    layout_pipeline = create_layout_pipeline(
+        preset["layout_kind"],
+        ov_root / preset["layout_subdir"],
+        args.device,
+        verbose=args.verbose_layout,
+    )
+    if args.layout_threshold is not None:
+        layout_pipeline.draw_threshold = args.layout_threshold
+        print(f"  Layout threshold: {args.layout_threshold}")
+    ocr_pipeline = PaddleOCRVLPipeline(ov_root / preset["vl_subdir"], device_name=args.device)
+    model_load_time = time.time() - model_load_start
+    print(f"Model load time: {model_load_time:.2f}s\n")
+
+    # ── Process each image ───────────────────────────────────────────────────
+    all_start = time.time()
+    per_image_times = []
+    failed = []
+
+    for idx, img_path in enumerate(image_files):
+        print(f"\n{'='*60}")
+        print(f"[{idx+1}/{len(image_files)}] {img_path.name}")
+        try:
+            _, img_time = run_end_to_end(
+                image_path=img_path,
+                pipeline_name=args.pipeline,
+                ov_root=ov_root,
+                device=args.device,
+                verbose_layout=args.verbose_layout,
+                layout_threshold=args.layout_threshold,
+                debug=bool(args.debug),
+                layout_pipeline=layout_pipeline,
+                ocr_pipeline=ocr_pipeline,
+            )
+            per_image_times.append((img_path.name, img_time))
+        except Exception as exc:
+            print(f"  FAILED: {exc}")
+            failed.append((img_path.name, str(exc)))
+
+    total_wall = time.time() - all_start
+    inference_total = sum(t for _, t in per_image_times)
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    n = len(image_files)
+    print(f"\n{'='*60}")
+    print(f"SUMMARY  ({len(per_image_times)}/{n} succeeded, {len(failed)} failed)")
+    print(f"  Model load time : {model_load_time:.2f}s")
+    if per_image_times:
+        avg = inference_total / len(per_image_times)
+        print(f"  Per-image times :")
+        for name, t in per_image_times:
+            print(f"    {name}: {t:.2f}s")
+        print(f"  Average per image: {avg:.2f}s")
+        print(f"  Inference total  : {inference_total:.2f}s")
+    print(f"  Wall-clock total : {total_wall:.2f}s")
+    if failed:
+        print(f"\n  Failed images:")
+        for name, err in failed:
+            print(f"    {name}: {err}")
+
 
 if __name__ == "__main__":
     main()
