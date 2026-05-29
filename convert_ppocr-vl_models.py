@@ -1,4 +1,4 @@
-"""
+﻿"""
 一键转换 PP-OCR-models 下 VL 模型到 OpenVINO 格式，保存到 PP-OCR-OV-models。
 包含 OV Tokenizer / Detokenizer 转换。
 
@@ -23,6 +23,42 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
 import numpy as np
 import sys
+
+# ─────────────────────────── precision helpers ────────────────────────────
+
+# Default weight precision for the size-dominant models. Override via --precision.
+#   fp32 : no compression (largest, reference accuracy)
+#   fp16 : half precision weights  (~2x smaller, safe for these models)
+#   int8 : NNCF weight-only INT8   (~4x smaller, minimal accuracy loss, needs nncf)
+DEFAULT_PRECISION = "fp16"
+
+_INT8_WARNED = False
+
+
+def _save_ov(ov_model, out_file: Path, precision: str = DEFAULT_PRECISION):
+    """Save an OpenVINO model with the requested weight precision.
+
+    INT8 uses NNCF weight-only compression (per-channel), which keeps
+    activations in float and dequantizes weights on the fly – the standard
+    OpenVINO recipe for shrinking LLM/transformer weights with negligible
+    accuracy impact. Falls back to fp16 if NNCF is unavailable.
+    """
+    global _INT8_WARNED
+    if precision == "int8":
+        try:
+            import nncf  # type: ignore
+            compressed = nncf.compress_weights(
+                ov_model, mode=nncf.CompressWeightsMode.INT8_ASYM
+            )
+            ov.save_model(compressed, out_file, compress_to_fp16=False)
+            return
+        except ImportError:
+            if not _INT8_WARNED:
+                print("  ⚠ nncf 未安装，int8 回退为 fp16（pip install nncf 以启用 int8）")
+                _INT8_WARNED = True
+            precision = "fp16"
+
+    ov.save_model(ov_model, out_file, compress_to_fp16=(precision == "fp16"))
 
 # ─────────────────────────── VL (v1) wrappers ─────────────────────────────
 
@@ -207,7 +243,8 @@ class LMHeadWrapper(torch.nn.Module):
 # ─────────────────────── shared helpers ───────────────────────────────────
 
 def _export_common(model, output_dir, tokenizer, skip_existing,
-                   num_layers, num_kv_heads, head_dim, hidden_size):
+                   num_layers, num_kv_heads, head_dim, hidden_size,
+                   precision: str = DEFAULT_PRECISION):
     """Export text_embed, text_decoder, lm_head, tokenizer/detokenizer."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -236,7 +273,7 @@ def _export_common(model, output_dir, tokenizer, skip_existing,
             example_input=input_ids,
             input=[("input_ids", ov.PartialShape([1, -1]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  ✅ text_embed.xml 已保存")
 
     # Text Decoder
@@ -269,7 +306,7 @@ def _export_common(model, output_dir, tokenizer, skip_existing,
             ov_model.inputs[i].get_node().set_partial_shape(
                 ov.PartialShape([1, num_kv_heads, -1, head_dim])
             )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  ✅ text_decoder.xml 已保存")
 
     # LM Head
@@ -285,13 +322,14 @@ def _export_common(model, output_dir, tokenizer, skip_existing,
             example_input=hidden_states,
             input=[("hidden_states", ov.PartialShape([1, -1, hidden_size]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  ✅ lm_head.xml 已保存")
 
 
 # ─────────────────────── VL (v1) conversion ───────────────────────────────
 
-def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = True):
+def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = True,
+                     precision: str = DEFAULT_PRECISION):
     """转换 PaddleOCR-VL (v1, 整图接口) 到 OpenVINO 格式。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n{'='*60}\n转换 VL (v1) 模型: {model_path}\n输出: {output_dir}\n{'='*60}")
@@ -326,7 +364,7 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
             example_input=torch.randn(1, 3, 224, 224),
             input=[("pixel_values", ov.PartialShape([1, 3, -1, -1]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  ✅ vision_patch_embed.xml 已保存")
 
     # 2. Vision Encoder
@@ -350,7 +388,7 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
                 ("width_position_ids", ov.PartialShape([-1])),
             ]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  ✅ vision_encoder.xml 已保存")
 
     # 3. Projector PreNorm
@@ -365,7 +403,7 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
             example_input=torch.randn(1, 256, vision_hidden),
             input=[("x", ov.PartialShape([1, -1, vision_hidden]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  ✅ projector_prenorm.xml 已保存")
 
     # 4. Projector MLP
@@ -380,12 +418,12 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
             example_input=torch.randn(1, 256, projector_in),
             input=[("x", ov.PartialShape([1, -1, projector_in]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  ✅ projector_mlp.xml 已保存")
 
     # 5–7. Common: text_embed, text_decoder, lm_head, tokenizer
     _export_common(model, output_dir, tokenizer, skip_existing,
-                   num_layers, num_kv_heads, head_dim, hidden_size)
+                   num_layers, num_kv_heads, head_dim, hidden_size, precision)
 
     # 8. Position Embeddings (VL v1 uses interpolated pos embed in Python)
     pos_file = output_dir / "position_embedding.npy"
@@ -405,7 +443,8 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
 
 # ─────────────────────── VL-1.5 whole-image conversion ────────────────────
 
-def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = True):
+def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = True,
+                       precision: str = DEFAULT_PRECISION):
     """Convert PaddleOCR-VL-1.5 to OpenVINO format using the same whole-image
     interface as VL v1.
 
@@ -465,7 +504,7 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
             example_input=torch.randn(1, 3, 224, 224),
             input=[("pixel_values", ov.PartialShape([1, 3, -1, -1]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  Saved vision_patch_embed.xml")
 
     # 2. Vision Encoder  [1, N, D] → [1, N, D]
@@ -489,7 +528,7 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
                 ("width_position_ids", ov.PartialShape([-1])),
             ]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  Saved vision_encoder.xml")
 
     # 3. Projector PreNorm  [1, N, D] → [1, N, D]
@@ -504,7 +543,7 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
             example_input=torch.randn(1, 256, vision_hidden),
             input=[("x", ov.PartialShape([1, -1, vision_hidden]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  Saved projector_prenorm.xml")
 
     # 4. Projector MLP  [1, N_out, D*4] → [1, N_out, D_text]
@@ -519,12 +558,12 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
             example_input=torch.randn(1, 64, projector_in),
             input=[("x", ov.PartialShape([1, -1, projector_in]))]
         )
-        ov.save_model(ov_model, out_file, compress_to_fp16=False)
+        _save_ov(ov_model, out_file, precision)
         print("  Saved projector_mlp.xml")
 
     # 5–7. text_embed, text_decoder, lm_head, tokenizer/detokenizer
     _export_common(model, output_dir, tokenizer, skip_existing,
-                   num_layers, num_kv_heads, head_dim, hidden_size)
+                   num_layers, num_kv_heads, head_dim, hidden_size, precision)
 
     # 8. Position embeddings (used by the Python inference code for interpolation)
     pos_file = output_dir / "position_embedding.npy"
@@ -544,23 +583,57 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
 
 # ──────────────────────────── main ────────────────────────────────────────
 
+def _resolve_base(name: str) -> Path:
+    """Locate a model folder regardless of the current working directory.
+
+    Tries (in order): the cwd, the script's own directory, and the script's
+    parent directory (the repo root where PP-OCR-models actually lives).
+    Falls back to an absolute path under the script parent so that
+    transformers always receives a real local directory instead of treating
+    the string as a Hugging Face Hub repo id.
+    """
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        Path.cwd() / name,
+        script_dir / name,
+        script_dir.parent / name,
+    ]
+    for cand in candidates:
+        if cand.is_dir():
+            return cand.resolve()
+    return (script_dir.parent / name).resolve()
+
+
 def main():
-    base = Path("PP-OCR-models")
-    out_base = Path("PP-OCR-OV-models")
+    base = _resolve_base("PP-OCR-models")
+    out_base = _resolve_base("PP-OCR-OV-models")
 
     force = "--force" in sys.argv
     skip_existing = not force
     only_v1 = "--only-vl1" in sys.argv
     only_v15 = "--only-vl15" in sys.argv
 
+    # --precision {fp32,fp16,int8}  (default fp16). Accepts "--precision int8" or "--precision=int8".
+    precision = DEFAULT_PRECISION
+    for i, arg in enumerate(sys.argv):
+        if arg.startswith("--precision="):
+            precision = arg.split("=", 1)[1].strip().lower()
+        elif arg == "--precision" and i + 1 < len(sys.argv):
+            precision = sys.argv[i + 1].strip().lower()
+    if precision not in ("fp32", "fp16", "int8"):
+        print(f"⚠ 未知 precision='{precision}'，回退为 {DEFAULT_PRECISION}")
+        precision = DEFAULT_PRECISION
+
     print("PP-OCR 模型批量转换脚本")
     print(f"skip_existing={skip_existing}  (--force 强制重转)")
+    print(f"weight precision = {precision}  (--precision fp32|fp16|int8)")
 
     if not only_v15:
         convert_vl_model(
             model_path=str(base / "PaddleOCR-VL"),
             output_dir=out_base / "PaddleOCR-VL-ov",
             skip_existing=skip_existing,
+            precision=precision,
         )
 
     if not only_v1:
@@ -568,6 +641,7 @@ def main():
             model_path=str(base / "PaddleOCR-VL-1.5"),
             output_dir=out_base / "PaddleOCR-VL-1.5-ov",
             skip_existing=skip_existing,
+            precision=precision,
         )
 
     print("\n" + "=" * 60)

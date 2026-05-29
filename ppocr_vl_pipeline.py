@@ -20,6 +20,22 @@ WORKING_DIR = Path(__file__).resolve().parent
 OV_MODELS_ROOT = WORKING_DIR / "PP-OCR-OV-models"
 DEFAULT_DEVICE = "GPU"
 
+# Compiled-model cache: avoids re-JIT'ing kernels on every run (big win on GPU).
+OV_CACHE_DIR = WORKING_DIR / ".ov_cache"
+# Single-stream latency hint – we run one image/region at a time.
+_COMPILE_CONFIG = {"PERFORMANCE_HINT": "LATENCY"}
+
+
+def _make_core() -> "ov.Core":
+    """Create an OpenVINO Core with on-disk kernel caching enabled."""
+    core = ov.Core()
+    try:
+        OV_CACHE_DIR.mkdir(exist_ok=True)
+        core.set_property({"CACHE_DIR": str(OV_CACHE_DIR)})
+    except Exception as exc:  # caching is best-effort
+        print(f"  (model cache disabled: {exc})")
+    return core
+
 PIPELINE_PRESETS = {
     # PP-DocLayoutV2 + PaddleOCR-VL
     "v2_vl": {
@@ -727,20 +743,19 @@ class PaddleOCRVLPipeline:
         self.model_dir = Path(model_dir)
         self.device = device_name
         self.vl = load_vl_runtime_config(self.model_dir)
-        self.core = ov.Core()
+        self.core = _make_core()
         self.tokenizer = SPTokenizer(self.model_dir)
 
         print(f"Loading VL models from {self.model_dir} ...")
         md = self.model_dir
-
-        md = self.model_dir
-        self.vision_patch_embed = self.core.compile_model(str(md / "vision_patch_embed.xml"), device_name)
-        self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name)
-        self.projector_prenorm = self.core.compile_model(str(md / "projector_prenorm.xml"), device_name)
-        self.projector_mlp = self.core.compile_model(str(md / "projector_mlp.xml"), device_name)
-        self.text_embed = self.core.compile_model(str(md / "text_embed.xml"), device_name)
-        self.text_decoder = self.core.compile_model(str(md / "text_decoder.xml"), device_name)
-        self.lm_head = self.core.compile_model(str(md / "lm_head.xml"), device_name)
+        cfg = _COMPILE_CONFIG
+        self.vision_patch_embed = self.core.compile_model(str(md / "vision_patch_embed.xml"), device_name, cfg)
+        self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name, cfg)
+        self.projector_prenorm = self.core.compile_model(str(md / "projector_prenorm.xml"), device_name, cfg)
+        self.projector_mlp = self.core.compile_model(str(md / "projector_mlp.xml"), device_name, cfg)
+        self.text_embed = self.core.compile_model(str(md / "text_embed.xml"), device_name, cfg)
+        self.text_decoder = self.core.compile_model(str(md / "text_decoder.xml"), device_name, cfg)
+        self.lm_head = self.core.compile_model(str(md / "lm_head.xml"), device_name, cfg)
         self.position_embedding = torch.tensor(np.load(md / "position_embedding.npy"))
         self.patch_size = self.vl["patch_size"]
         self.spatial_merge_size = self.vl["spatial_merge_size"]
@@ -831,21 +846,24 @@ class PaddleOCRVLPipeline:
         # print(f"Position IDs[:, :, :10]: {position_ids[:, :, :10]}")
         # print(f"Position IDs[:, :, -10:]: {position_ids[:, :, -10:]}")
         
-        # 6. Generation Loop
-        past_key_values = []
+        # 6. Generation Loop (numpy-only; numerically identical to the torch path
+        #    but without per-token torch object churn / extra conversions)
         num_layers = cfg["num_hidden_layers"]
         num_kv_heads = cfg.get("num_key_value_heads", cfg["num_attention_heads"])
         head_dim = cfg["head_dim"]
 
-        # Initialize empty past_key_values
-        for _ in range(num_layers):
-            k = torch.zeros(1, num_kv_heads, 0, head_dim)
-            v = torch.zeros(1, num_kv_heads, 0, head_dim)
-            past_key_values.extend([k, v])
+        # Static inputs as contiguous numpy (fed to OV without further copies)
+        inputs_embeds_np = np.ascontiguousarray(inputs_embeds.detach().numpy(), dtype=np.float32)
+        position_ids_np = np.ascontiguousarray(position_ids.detach().numpy(), dtype=np.int64)  # [3,1,L]
+
+        # KV cache held as numpy arrays we own (so OV's next infer can't alias/overwrite
+        # them). Feeding via ov.Tensor(arr) wraps the buffer without copying.
+        empty_kv = np.zeros((1, num_kv_heads, 0, head_dim), dtype=np.float32)
+        past_arrays = [empty_kv for _ in range(2 * num_layers)]
 
         generated_ids = []
-        start_time = time.time()
         infer_request = self.text_decoder.create_infer_request()
+        n_dec_out = len(self.text_decoder.outputs)
 
         # Per-task token limits
         _TASK_MAX_TOKENS = {
@@ -872,33 +890,37 @@ class PaddleOCRVLPipeline:
                     return True
             return False
 
+        total_len = inputs_embeds_np.shape[1]
+        next_token_embed = None
         for i in range(max_new_tokens):
             if i == 0:
-                curr_inputs_embeds = inputs_embeds
-                curr_position_ids = position_ids
-                curr_attention_mask = torch.ones(1, inputs_embeds.shape[1], dtype=torch.long)
+                emb_t = ov.Tensor(inputs_embeds_np)
+                pos_t = ov.Tensor(position_ids_np)
+                mask_t = ov.Tensor(np.ones((1, total_len), dtype=np.int64))
             else:
-                curr_inputs_embeds = next_token_embed
-                last_pos = position_ids[:, :, -1:] + 1
-                curr_position_ids = last_pos
-                position_ids = torch.cat([position_ids, last_pos], dim=2)
-                curr_attention_mask = torch.ones(1, position_ids.shape[2], dtype=torch.long)
+                emb_t = ov.Tensor(next_token_embed)
+                next_pos = position_ids_np[:, :, -1:] + 1            # [3,1,1]
+                position_ids_np = np.concatenate([position_ids_np, next_pos], axis=2)
+                pos_t = ov.Tensor(np.ascontiguousarray(next_pos))
+                total_len += 1
+                mask_t = ov.Tensor(np.ones((1, total_len), dtype=np.int64))
 
-            inputs = [curr_inputs_embeds, curr_attention_mask, curr_position_ids] + past_key_values
-            for idx, input_tensor in enumerate(inputs):
-                infer_request.set_input_tensor(idx, ov.Tensor(input_tensor.detach().numpy()))
+            infer_request.set_input_tensor(0, emb_t)
+            infer_request.set_input_tensor(1, mask_t)
+            infer_request.set_input_tensor(2, pos_t)
+            for layer_idx in range(2 * num_layers):
+                infer_request.set_input_tensor(3 + layer_idx, ov.Tensor(past_arrays[layer_idx]))
 
             infer_request.infer()
 
-            hidden_states = torch.tensor(infer_request.get_output_tensor(0).data)
+            # Copy present_kv into buffers we own before the next infer can touch them.
+            past_arrays = [np.array(infer_request.get_output_tensor(idx).data)
+                           for idx in range(1, n_dec_out)]
 
-            new_past = []
-            for idx in range(1, len(self.text_decoder.outputs)):
-                new_past.append(torch.tensor(infer_request.get_output_tensor(idx).data))
-            past_key_values = new_past
-
-            logits = torch.tensor(self.lm_head([hidden_states[:, -1:, :]])[0])
-            next_token_id = torch.argmax(logits, dim=-1).item()
+            # LM head only needs the final position's hidden state.
+            hidden_last = np.array(infer_request.get_output_tensor(0).data[:, -1:, :])
+            logits = self.lm_head([hidden_last])[0]
+            next_token_id = int(np.argmax(logits[0, -1]))
             generated_ids.append(next_token_id)
 
             if next_token_id == self.tokenizer.eos_token_id:
@@ -923,8 +945,8 @@ class PaddleOCRVLPipeline:
                             break
                 break
 
-            next_token_tensor = torch.tensor([[next_token_id]], dtype=torch.long)
-            next_token_embed = torch.tensor(self.text_embed([next_token_tensor])[0])
+            next_token_np = np.array([[next_token_id]], dtype=np.int64)
+            next_token_embed = np.ascontiguousarray(self.text_embed([next_token_np])[0], dtype=np.float32)
 
         text = self.tokenizer.decode(generated_ids)
         # Strip leading whitespace / newlines produced by the prompt prefix
@@ -985,11 +1007,12 @@ class PPDocLayoutV2Pipeline:
 
         self.draw_threshold = self.config.get("draw_threshold", 0.5)
 
-        self.core = ov.Core()
+        self.core = _make_core()
         print(f"[Layout V2] {self.model_path}")
         self.compiled_model = self.core.compile_model(
             self.core.read_model(model=str(self.model_path)),
             device_name=self.device,
+            config=_COMPILE_CONFIG,
         )
 
     def preprocess(self, image):
@@ -1088,11 +1111,12 @@ class PPDocLayoutV3Pipeline:
                 f" 原始错误: {exc}"
             ) from exc
 
-        self.core = ov.Core()
+        self.core = _make_core()
         print(f"[Layout V3] {self.model_path}")
         self.compiled_model = self.core.compile_model(
             self.core.read_model(model=str(self.model_path)),
             device_name=self.device,
+            config=_COMPILE_CONFIG,
         )
         self._out_names = [o.get_any_name() for o in self.compiled_model.outputs]
 
@@ -1387,8 +1411,10 @@ def run_end_to_end(
     if debug:
         print(f"Saved Markdown result to {output_dir}")
     
-    # Save save_to_img (Visualization of layout)
-    ocr_result.save_to_img(save_path=str(output_dir / "vis_layout.jpg"))
+    # Save save_to_img (Visualization of layout) — per-image name so results
+    # for a folder don't overwrite each other.
+    vis_stem = Path(str(image_path)).stem or "vis_layout"
+    ocr_result.save_to_img(save_path=str(output_dir / f"{vis_stem}_vis_layout.jpg"))
     if debug:
         print(f"Saved detection result to {output_dir}")
         ocr_result.print()
