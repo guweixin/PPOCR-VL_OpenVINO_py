@@ -1,0 +1,10 @@
+# OpenVINO compiled-model cache
+.ov_cache/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Output / debug artifacts
+output/
+*.log

@@ -761,7 +761,11 @@ class PaddleOCRVLPipeline:
         self.spatial_merge_size = self.vl["spatial_merge_size"]
         self.image_mean = self.vl["image_mean"]
         self.image_std = self.vl["image_std"]
-        print("  Vision pipeline: whole-image")
+        n_dec_in = len(self.text_decoder.inputs)
+        self._is_stateful = (n_dec_in == 3)
+        self._decode_debug = os.environ.get("PPOCR_DECODE_DEBUG", "0") == "1"
+        print(f"  Vision pipeline: whole-image | text_decoder inputs={n_dec_in} "
+              f"({'stateful' if self._is_stateful else 'legacy'})")
 
     def _encode_image_v1(self, pixel_values, grid_thw):
         """Whole-image encode path (used by both VL v1 and VL-1.5)."""
@@ -856,14 +860,23 @@ class PaddleOCRVLPipeline:
         inputs_embeds_np = np.ascontiguousarray(inputs_embeds.detach().numpy(), dtype=np.float32)
         position_ids_np = np.ascontiguousarray(position_ids.detach().numpy(), dtype=np.int64)  # [3,1,L]
 
-        # KV cache held as numpy arrays we own (so OV's next infer can't alias/overwrite
-        # them). Feeding via ov.Tensor(arr) wraps the buffer without copying.
-        empty_kv = np.zeros((1, num_kv_heads, 0, head_dim), dtype=np.float32)
-        past_arrays = [empty_kv for _ in range(2 * num_layers)]
+        # The decoder is either stateful (KV cache on-device: 3 inputs / 1 output)
+        # or legacy (explicit past/present KV ports). Auto-detect by input count so
+        # the pipeline works with either exported model.
+        stateful = len(self.text_decoder.inputs) == 3
+        if not stateful:
+            # KV cache held as numpy arrays we own (OV's next infer can't alias them).
+            empty_kv = np.zeros((1, num_kv_heads, 0, head_dim), dtype=np.float32)
+            past_arrays = [empty_kv for _ in range(2 * num_layers)]
 
         generated_ids = []
         infer_request = self.text_decoder.create_infer_request()
         n_dec_out = len(self.text_decoder.outputs)
+        if stateful:
+            infer_request.reset_state()   # start this sequence with an empty KV state
+
+        # Timing accumulators (only reported when PPOCR_DECODE_DEBUG=1)
+        t_prefill = 0.0; t_decode = 0.0; t_lmhead = 0.0; t_embed = 0.0
 
         # Per-task token limits
         _TASK_MAX_TOKENS = {
@@ -891,6 +904,7 @@ class PaddleOCRVLPipeline:
             return False
 
         total_len = inputs_embeds_np.shape[1]
+        last_pos = position_ids_np[:, :, -1:].copy()   # [3,1,1] last RoPE position
         next_token_embed = None
         for i in range(max_new_tokens):
             if i == 0:
@@ -899,27 +913,36 @@ class PaddleOCRVLPipeline:
                 mask_t = ov.Tensor(np.ones((1, total_len), dtype=np.int64))
             else:
                 emb_t = ov.Tensor(next_token_embed)
-                next_pos = position_ids_np[:, :, -1:] + 1            # [3,1,1]
-                position_ids_np = np.concatenate([position_ids_np, next_pos], axis=2)
-                pos_t = ov.Tensor(np.ascontiguousarray(next_pos))
+                last_pos = last_pos + 1                 # next position = last + 1
+                pos_t = ov.Tensor(np.ascontiguousarray(last_pos))
                 total_len += 1
                 mask_t = ov.Tensor(np.ones((1, total_len), dtype=np.int64))
 
             infer_request.set_input_tensor(0, emb_t)
             infer_request.set_input_tensor(1, mask_t)
             infer_request.set_input_tensor(2, pos_t)
-            for layer_idx in range(2 * num_layers):
-                infer_request.set_input_tensor(3 + layer_idx, ov.Tensor(past_arrays[layer_idx]))
+            if not stateful:
+                for layer_idx in range(2 * num_layers):
+                    infer_request.set_input_tensor(3 + layer_idx, ov.Tensor(past_arrays[layer_idx]))
 
+            _t0 = time.perf_counter()
             infer_request.infer()
+            _t1 = time.perf_counter()
+            if i == 0:
+                t_prefill += _t1 - _t0
+            else:
+                t_decode += _t1 - _t0
 
-            # Copy present_kv into buffers we own before the next infer can touch them.
-            past_arrays = [np.array(infer_request.get_output_tensor(idx).data)
-                           for idx in range(1, n_dec_out)]
+            if not stateful:
+                # Copy present_kv into buffers we own before the next infer touches them.
+                past_arrays = [np.array(infer_request.get_output_tensor(idx).data)
+                               for idx in range(1, n_dec_out)]
 
             # LM head only needs the final position's hidden state.
             hidden_last = np.array(infer_request.get_output_tensor(0).data[:, -1:, :])
+            _t0 = time.perf_counter()
             logits = self.lm_head([hidden_last])[0]
+            t_lmhead += time.perf_counter() - _t0
             next_token_id = int(np.argmax(logits[0, -1]))
             generated_ids.append(next_token_id)
 
@@ -946,7 +969,17 @@ class PaddleOCRVLPipeline:
                 break
 
             next_token_np = np.array([[next_token_id]], dtype=np.int64)
+            _t0 = time.perf_counter()
             next_token_embed = np.ascontiguousarray(self.text_embed([next_token_np])[0], dtype=np.float32)
+            t_embed += time.perf_counter() - _t0
+
+        if self._decode_debug:
+            n_tok = len(generated_ids)
+            n_steps = max(n_tok, 1)
+            mode = "stateful" if stateful else "legacy"
+            print(f"  [decode/{mode}] tokens={n_tok}  prefill={t_prefill*1e3:.1f}ms  "
+                  f"decode={t_decode*1e3:.1f}ms ({t_decode/n_steps*1e3:.2f}ms/tok)  "
+                  f"lm_head={t_lmhead*1e3:.1f}ms  text_embed={t_embed*1e3:.1f}ms", flush=True)
 
         text = self.tokenizer.decode(generated_ids)
         # Strip leading whitespace / newlines produced by the prompt prefix

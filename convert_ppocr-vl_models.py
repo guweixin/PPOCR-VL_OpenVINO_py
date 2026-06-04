@@ -14,6 +14,8 @@ PP-DocLayoutV2/V3 转换见 convert_doclayout.py（需自定义编译的 OV）�
 
 运行（ppocr-vl 环境或 WSL paddle_env）：
   python convert_ppocr-vl_models.py [--force] [--only-vl1 | --only-vl15]
+  # Recommended "smaller-but-safe" experiment: int8 vision, fp16 text
+  python convert_ppocr-vl_models.py --force --only-vl15 --vision-precision int8 --text-precision fp16
 """
 
 import torch
@@ -26,23 +28,21 @@ import sys
 
 # ─────────────────────────── precision helpers ────────────────────────────
 
-# Default weight precision for the size-dominant models. Override via --precision.
+# Weight precision for the converted models.
+#   fp16 : half-precision weights (~2x smaller, accuracy on par with bf16) — default
 #   fp32 : no compression (largest, reference accuracy)
-#   fp16 : half precision weights  (~2x smaller, safe for these models)
-#   int8 : NNCF weight-only INT8   (~4x smaller, minimal accuracy loss, needs nncf)
+#   int8 : NNCF weight-only INT8 (~2x smaller than fp16, ~2x less per-token memory
+#          traffic). Decode is memory-bandwidth bound, so int8 ONLY on the
+#          text_decoder + lm_head (the weights re-read every token) is the one
+#          real decode speedup. Do NOT int8 the vision encoder — that corrupts
+#          image features and collapses accuracy (>100% CER). Use --int8-decoder.
 DEFAULT_PRECISION = "fp16"
 
 _INT8_WARNED = False
 
 
 def _save_ov(ov_model, out_file: Path, precision: str = DEFAULT_PRECISION):
-    """Save an OpenVINO model with the requested weight precision.
-
-    INT8 uses NNCF weight-only compression (per-channel), which keeps
-    activations in float and dequantizes weights on the fly – the standard
-    OpenVINO recipe for shrinking LLM/transformer weights with negligible
-    accuracy impact. Falls back to fp16 if NNCF is unavailable.
-    """
+    """Save an OpenVINO model as fp16 (default), fp32, or int8 weights."""
     global _INT8_WARNED
     if precision == "int8":
         try:
@@ -54,11 +54,46 @@ def _save_ov(ov_model, out_file: Path, precision: str = DEFAULT_PRECISION):
             return
         except ImportError:
             if not _INT8_WARNED:
-                print("  ⚠ nncf 未安装，int8 回退为 fp16（pip install nncf 以启用 int8）")
+                print("  ⚠ nncf 未安装，int8 回退为 fp16（pip install nncf）")
                 _INT8_WARNED = True
             precision = "fp16"
-
     ov.save_model(ov_model, out_file, compress_to_fp16=(precision == "fp16"))
+
+
+def _make_decoder_stateful(ov_model, num_layers: int):
+    """Turn the decoder's explicit past/present KV ports into in-model state.
+
+    The traced decoder has inputs [inputs_embeds, attention_mask, position_ids,
+    past_kv_0 ... past_kv_{2L-1}] and outputs [hidden_states, present_kv_0 ...].
+    `MakeStateful` replaces each (past_kv_i -> present_kv_i) pair with a
+    ReadValue/Assign pair backed by an on-device Variable, so the growing KV
+    cache never crosses the Python/host boundary (eliminates the O(n²) copies).
+
+    After the transform the decoder keeps only 3 inputs and 1 output
+    (hidden_states); KV is managed via infer_request state + reset_state().
+    Numerically identical to the explicit-cache decoder.
+    """
+    inputs = ov_model.inputs
+    outputs = ov_model.outputs
+    pair_names = {}
+    for i in range(2 * num_layers):
+        in_name = f"past_kv.{i}"
+        out_name = f"present_kv.{i}"
+        inputs[3 + i].get_tensor().set_names({in_name})
+        outputs[1 + i].get_tensor().set_names({out_name})
+        pair_names[in_name] = out_name
+
+    try:
+        from openvino._offline_transformations import apply_make_stateful_transformation
+        apply_make_stateful_transformation(ov_model, pair_names)
+    except ImportError:
+        from openvino.runtime.passes import Manager, MakeStateful
+        manager = Manager()
+        manager.register_pass(MakeStateful(pair_names))
+        manager.run_passes(ov_model)
+
+    ov_model.validate_nodes_and_infer_types()
+    return ov_model
 
 # ─────────────────────────── VL (v1) wrappers ─────────────────────────────
 
@@ -244,8 +279,16 @@ class LMHeadWrapper(torch.nn.Module):
 
 def _export_common(model, output_dir, tokenizer, skip_existing,
                    num_layers, num_kv_heads, head_dim, hidden_size,
-                   precision: str = DEFAULT_PRECISION):
-    """Export text_embed, text_decoder, lm_head, tokenizer/detokenizer."""
+                   precision: str = DEFAULT_PRECISION, stateful: bool = False,
+                   decoder_precision: str = None):
+    """Export text_embed, text_decoder, lm_head, tokenizer/detokenizer.
+
+    decoder_precision overrides the precision of text_decoder + lm_head only
+    (these weights are re-read every token, so int8 here is the one real decode
+    speedup). Defaults to `precision` when not given.
+    """
+    if decoder_precision is None:
+        decoder_precision = precision
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # OV Tokenizer / Detokenizer
@@ -306,8 +349,11 @@ def _export_common(model, output_dir, tokenizer, skip_existing,
             ov_model.inputs[i].get_node().set_partial_shape(
                 ov.PartialShape([1, num_kv_heads, -1, head_dim])
             )
-        _save_ov(ov_model, out_file, precision)
-        print("  ✅ text_decoder.xml 已保存")
+        if stateful:
+            ov_model = _make_decoder_stateful(ov_model, num_layers)
+            print("  (stateful: KV cache moved on-device)")
+        _save_ov(ov_model, out_file, decoder_precision)
+        print(f"  ✅ text_decoder.xml 已保存 ({decoder_precision})")
 
     # LM Head
     out_file = output_dir / "lm_head.xml"
@@ -322,14 +368,15 @@ def _export_common(model, output_dir, tokenizer, skip_existing,
             example_input=hidden_states,
             input=[("hidden_states", ov.PartialShape([1, -1, hidden_size]))]
         )
-        _save_ov(ov_model, out_file, precision)
-        print("  ✅ lm_head.xml 已保存")
+        _save_ov(ov_model, out_file, decoder_precision)
+        print(f"  ✅ lm_head.xml 已保存 ({decoder_precision})")
 
 
 # ─────────────────────── VL (v1) conversion ───────────────────────────────
 
 def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = True,
-                     precision: str = DEFAULT_PRECISION):
+                     precision: str = DEFAULT_PRECISION, stateful: bool = False,
+                     decoder_precision: str = None):
     """转换 PaddleOCR-VL (v1, 整图接口) 到 OpenVINO 格式。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n{'='*60}\n转换 VL (v1) 模型: {model_path}\n输出: {output_dir}\n{'='*60}")
@@ -423,7 +470,8 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
 
     # 5–7. Common: text_embed, text_decoder, lm_head, tokenizer
     _export_common(model, output_dir, tokenizer, skip_existing,
-                   num_layers, num_kv_heads, head_dim, hidden_size, precision)
+                   num_layers, num_kv_heads, head_dim, hidden_size, precision, stateful,
+                   decoder_precision)
 
     # 8. Position Embeddings (VL v1 uses interpolated pos embed in Python)
     pos_file = output_dir / "position_embedding.npy"
@@ -444,7 +492,8 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
 # ─────────────────────── VL-1.5 whole-image conversion ────────────────────
 
 def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = True,
-                       precision: str = DEFAULT_PRECISION):
+                       precision: str = DEFAULT_PRECISION, stateful: bool = False,
+                       decoder_precision: str = None):
     """Convert PaddleOCR-VL-1.5 to OpenVINO format using the same whole-image
     interface as VL v1.
 
@@ -563,7 +612,8 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
 
     # 5–7. text_embed, text_decoder, lm_head, tokenizer/detokenizer
     _export_common(model, output_dir, tokenizer, skip_existing,
-                   num_layers, num_kv_heads, head_dim, hidden_size, precision)
+                   num_layers, num_kv_heads, head_dim, hidden_size, precision, stateful,
+                   decoder_precision)
 
     # 8. Position embeddings (used by the Python inference code for interpolation)
     pos_file = output_dir / "position_embedding.npy"
@@ -613,20 +663,32 @@ def main():
     only_v1 = "--only-vl1" in sys.argv
     only_v15 = "--only-vl15" in sys.argv
 
-    # --precision {fp32,fp16,int8}  (default fp16). Accepts "--precision int8" or "--precision=int8".
+    # --precision {fp32,fp16}  (default fp16). Accepts "--precision fp32" or "--precision=fp32".
     precision = DEFAULT_PRECISION
     for i, arg in enumerate(sys.argv):
         if arg.startswith("--precision="):
             precision = arg.split("=", 1)[1].strip().lower()
         elif arg == "--precision" and i + 1 < len(sys.argv):
             precision = sys.argv[i + 1].strip().lower()
-    if precision not in ("fp32", "fp16", "int8"):
+    if precision not in ("fp32", "fp16"):
         print(f"⚠ 未知 precision='{precision}'，回退为 {DEFAULT_PRECISION}")
         precision = DEFAULT_PRECISION
 
+    # Legacy explicit-KV decoder is the default — it's faster for short OCR
+    # outputs. --stateful exports the on-device-KV variant, which only pays off
+    # for very long sequences (large tables / full pages).
+    stateful = "--stateful" in sys.argv
+
+    # --int8-decoder: int8 weight-only on text_decoder + lm_head ONLY (the weights
+    # re-read every token). Vision + text_embed stay at --precision. This is the
+    # one real decode speedup (decode is memory-bandwidth bound). Needs nncf.
+    decoder_precision = "int8" if "--int8-decoder" in sys.argv else precision
+
     print("PP-OCR 模型批量转换脚本")
     print(f"skip_existing={skip_existing}  (--force 强制重转)")
-    print(f"weight precision = {precision}  (--precision fp32|fp16|int8)")
+    print(f"weight precision = {precision}  (--precision fp32|fp16)")
+    print(f"decoder/lm_head precision = {decoder_precision}  (--int8-decoder 开启 int8)")
+    print(f"stateful decoder = {stateful}  (--stateful 开启; 默认 legacy，短文本更快)")
 
     if not only_v15:
         convert_vl_model(
@@ -634,6 +696,8 @@ def main():
             output_dir=out_base / "PaddleOCR-VL-ov",
             skip_existing=skip_existing,
             precision=precision,
+            stateful=stateful,
+            decoder_precision=decoder_precision,
         )
 
     if not only_v1:
@@ -642,6 +706,8 @@ def main():
             output_dir=out_base / "PaddleOCR-VL-1.5-ov",
             skip_existing=skip_existing,
             precision=precision,
+            stateful=stateful,
+            decoder_precision=decoder_precision,
         )
 
     print("\n" + "=" * 60)
