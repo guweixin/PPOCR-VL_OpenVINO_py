@@ -1,4 +1,11 @@
 import openvino as ov
+try:
+    # Must be imported before any ov.Core() is created: it registers the custom
+    # tokenizer ops (e.g. SpecialTokensSplit) so tokenizer.xml/detokenizer.xml load.
+    import openvino_tokenizers  # noqa: F401
+except ImportError as _e:  # pragma: no cover - surfaced clearly at runtime
+    openvino_tokenizers = None
+    _OV_TOKENIZERS_IMPORT_ERROR = _e
 import numpy as np
 import cv2
 import yaml
@@ -9,7 +16,6 @@ import math
 import copy
 import mimetypes
 import os
-import sentencepiece as spm
 from typing import List, Optional, Union, Dict, Any, Callable
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
@@ -55,7 +61,7 @@ PIPELINE_PRESETS = {
 DEFAULT_PIPELINE = "v3_vl15"
 
 
-def load_vl_runtime_config(model_dir: Path) -> dict:
+def load_vl_runtime_config(model_dir: Path, tokenizer) -> dict:
     model_dir = Path(model_dir)
     with open(model_dir / "config.json", "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -89,11 +95,11 @@ def load_vl_runtime_config(model_dir: Path) -> dict:
     vision_start_token_id = added_tokens.get("<|IMAGE_START|>", config.get("vision_start_token_id"))
     vision_end_token_id = added_tokens.get("<|IMAGE_END|>", config.get("vision_end_token_id"))
 
-    # Prefix/suffix tokens via SP (plain text, no special tokens needed)
-    import sentencepiece as spm
-    sp_tmp = spm.SentencePieceProcessor(model_file=str(model_dir / "tokenizer.model"))
-    user_prefix_ids = sp_tmp.encode("User: ")         # [2969, 93963, 93919]
-    asst_suffix_ids = sp_tmp.encode("\nAssistant:\n") # [23, 92267, 93963, 23]
+    # Prefix/suffix tokens via the OV tokenizer (plain text, no special tokens).
+    # add_bos_token/add_eos_token are False in tokenizer_config, so these match
+    # the previous sentencepiece ids exactly.
+    user_prefix_ids = tokenizer.encode("User: ")         # [2969, 93963, 93919]
+    asst_suffix_ids = tokenizer.encode("\nAssistant:\n") # [23, 92267, 93963, 23]
 
     return {
         "config": config,
@@ -695,56 +701,94 @@ def get_rope_index(
     position_ids = torch.cat(pos_list, dim=1)
     return position_ids.unsqueeze(1) # [3, 1, L]
 
-class SPTokenizer:
-    def __init__(self, model_dir):
-        self.model_dir = Path(model_dir)
-        self.sp_model_path = self.model_dir / "tokenizer.model"
-        
-        if not self.sp_model_path.exists():
-             raise FileNotFoundError(f"SentencePiece model not found in {model_dir}")
+class OVTokenizer:
+    """OpenVINO tokenizer / detokenizer wrapper (replaces sentencepiece).
 
-        print("Loading SentencePiece Tokenizer...")
-        self.sp = spm.SentencePieceProcessor(model_file=str(self.sp_model_path))
-        
-        # Load Added Tokens for Decoding
-        self.added_tokens_path = self.model_dir / "added_tokens.json"
-        self.added_tokens_decoder = {}
-        if self.added_tokens_path.exists():
-            with open(self.added_tokens_path, "r", encoding="utf-8") as f:
-                added_tokens = json.load(f)
-                self.added_tokens_decoder = {int(v): k for k, v in added_tokens.items()}
-        
-        # Special Tokens
-        self.bos_token_id = self.sp.bos_id() if self.sp.bos_id() != -1 else 1 # Default to 1 if not set
-        self.eos_token_id = self.sp.eos_id() if self.sp.eos_id() != -1 else 2
+    Encodes/decodes via the ``tokenizer.xml`` / ``detokenizer.xml`` produced by
+    ``convert_tokenizer`` in the conversion script. ``add_bos_token`` /
+    ``add_eos_token`` are False in the source tokenizer, so ``encode`` yields the
+    same ids as the previous sentencepiece path. Tokenizers are string ops and
+    only run on CPU regardless of the inference device.
+    """
+
+    def __init__(self, model_dir, core=None):
+        self.model_dir = Path(model_dir)
+        tok_xml = self.model_dir / "tokenizer.xml"
+        detok_xml = self.model_dir / "detokenizer.xml"
+        if not tok_xml.exists() or not detok_xml.exists():
+            raise FileNotFoundError(
+                f"OV tokenizer.xml / detokenizer.xml not found in {model_dir}. "
+                f"Re-export with convert_ppocr-vl_models.py."
+            )
+
+        if openvino_tokenizers is None:
+            raise ImportError(
+                "openvino-tokenizers is required to run tokenizer.xml/detokenizer.xml. "
+                "Install it with: pip install openvino-tokenizers"
+            ) from _OV_TOKENIZERS_IMPORT_ERROR
+
+        print("Loading OpenVINO Tokenizer / Detokenizer ...")
+        self.core = core or ov.Core()
+        self._tok = self.core.compile_model(str(tok_xml), "CPU")
+        self._detok = self.core.compile_model(str(detok_xml), "CPU")
+
+        # Locate the "input_ids" output port (tokenizer also emits attention_mask).
+        self._ids_port = None
+        for p in self._tok.outputs:
+            if "input_ids" in p.get_any_name():
+                self._ids_port = p
+                break
+
+        self.bos_token_id, self.eos_token_id = self._load_special_ids()
+
+    def _load_special_ids(self):
+        """Resolve bos/eos ids from tokenizer_config.json (fallback 1 / 2)."""
+        bos_id, eos_id = 1, 2
+        cfg_path = self.model_dir / "tokenizer_config.json"
+        if cfg_path.exists():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            content_to_id = {
+                v.get("content"): int(k)
+                for k, v in cfg.get("added_tokens_decoder", {}).items()
+            }
+
+            def _content(tok):
+                return tok.get("content") if isinstance(tok, dict) else tok
+
+            bos = _content(cfg.get("bos_token"))
+            eos = _content(cfg.get("eos_token"))
+            if bos in content_to_id:
+                bos_id = content_to_id[bos]
+            if eos in content_to_id:
+                eos_id = content_to_id[eos]
+        return bos_id, eos_id
 
     def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
         if not isinstance(text, str):
             text = str(text)
-        return self.sp.encode(text)
+        res = self._tok([np.array([text])])
+        ids = res[self._ids_port] if self._ids_port is not None else list(res.values())[0]
+        return np.asarray(ids).reshape(-1).astype(np.int64).tolist()
 
     def decode(self, token_ids: List[int]) -> str:
-        text = ""
-        current_chunk = []
-        for id in token_ids:
-            if id in self.added_tokens_decoder:
-                if current_chunk:
-                    text += self.sp.decode(current_chunk)
-                    current_chunk = []
-                text += self.added_tokens_decoder[id]
-            else:
-                current_chunk.append(id)
-        if current_chunk:
-            text += self.sp.decode(current_chunk)
-        return text
+        if token_ids is None or len(token_ids) == 0:
+            return ""
+        arr = np.asarray([list(token_ids)], dtype=np.int64)
+        res = self._detok([arr])
+        val = list(res.values())[0]
+        out = val[0] if hasattr(val, "__len__") and len(val) else val
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        return str(out)
 
 class PaddleOCRVLPipeline:
     def __init__(self, model_dir: Path, device_name: str = DEFAULT_DEVICE):
         self.model_dir = Path(model_dir)
         self.device = device_name
-        self.vl = load_vl_runtime_config(self.model_dir)
         self.core = _make_core()
-        self.tokenizer = SPTokenizer(self.model_dir)
+        self.tokenizer = OVTokenizer(self.model_dir, self.core)
+        self.vl = load_vl_runtime_config(self.model_dir, self.tokenizer)
 
         print(f"Loading VL models from {self.model_dir} ...")
         md = self.model_dir
