@@ -78,18 +78,20 @@ def load_vl_runtime_config(model_dir: Path, tokenizer) -> dict:
         image_mean = preproc.get("image_mean", image_mean)
         image_std = preproc.get("image_std", image_std)
 
-    # BOS: try tokenizer.json vocab first, then added_tokens, then fallback to 1
+    # BOS: try added_tokens.json, then tokenizer_config.json's added_tokens_decoder,
+    # then fall back to 1. (tokenizer_config.json is already required by the
+    # tokenizer, so this avoids depending on the large tokenizer.json.)
     bos_chat = added_tokens.get("<|begin_of_sentence|>", None)
     if bos_chat is None:
-        tok_json_path = model_dir / "tokenizer.json"
-        if tok_json_path.exists():
-            with open(tok_json_path, "r", encoding="utf-8") as f:
-                tok_json = json.load(f)
-            vocab = tok_json.get("model", {}).get("vocab", {})
-            bos_chat = vocab.get("<|begin_of_sentence|>", None)
-            if bos_chat is None:
-                added_vocab = {e["content"]: e["id"] for e in tok_json.get("added_tokens", [])}
-                bos_chat = added_vocab.get("<|begin_of_sentence|>", 1)
+        tok_cfg_path = model_dir / "tokenizer_config.json"
+        if tok_cfg_path.exists():
+            with open(tok_cfg_path, "r", encoding="utf-8") as f:
+                tok_cfg = json.load(f)
+            content_to_id = {
+                v.get("content"): int(k)
+                for k, v in tok_cfg.get("added_tokens_decoder", {}).items()
+            }
+            bos_chat = content_to_id.get("<|begin_of_sentence|>", None)
     if bos_chat is None:
         bos_chat = 1
     vision_start_token_id = added_tokens.get("<|IMAGE_START|>", config.get("vision_start_token_id"))
