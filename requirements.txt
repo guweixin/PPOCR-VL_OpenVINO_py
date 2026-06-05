@@ -1,0 +1,25 @@
+# PPOCR-VL OpenVINO pipeline - Python dependencies
+# Pinned to the versions validated on the GLM-OCR environment.
+# Python 3.10+ recommended.
+
+# --- Inference (ppocr_vl_pipeline.py) ---
+openvino==2026.1.0
+openvino-tokenizers==2026.1.0.0   # loads tokenizer.xml/detokenizer.xml (replaces sentencepiece)
+numpy==2.4.4
+opencv-python==4.13.0.92
+pillow==12.2.0
+PyYAML==6.0.3
+
+# transformers is only needed for the PP-DocLayoutV3 layout post-processing
+# (default --pipeline v3_vl15). The --pipeline v2_vl path does not need it.
+transformers==5.8.1
+
+# torch is pulled in by transformers and used for VL pre/post-processing.
+# Install the build matching your platform/CUDA (the +cu130 wheel comes from
+# the PyTorch index, e.g. pip install torch --index-url https://download.pytorch.org/whl/cu130).
+torch==2.12.0
+
+# --- Model conversion only (convert_ppocr-vl_models.py) ---
+# Reuses openvino / openvino-tokenizers / transformers / torch / numpy above.
+# nncf is optional: required only for the --int8-decoder option.
+nncf==3.1.0
