@@ -161,6 +161,52 @@ class ProjectorMLPWrapper(torch.nn.Module):
         return x
 
 
+class VisionMergedWrapper15(torch.nn.Module):
+    """VL-1.5 merged vision graph: patch_embed + flatten + add pos_embed +
+    encoder + post_layernorm + projector pre_norm, all in one model.
+
+    This fuses what used to be 3 separate exported models
+    (vision_patch_embed, vision_encoder, projector_prenorm) into a single
+    `vision_encoder.xml`. The position-embedding interpolation and the 2×2
+    spatial merge stay in Python (deterministic), so the result is numerically
+    identical to the 4-model path.
+
+    Inputs:
+      pixel_values         [1, 3, H, W]
+      pos_embed            [1, N, D_vision]   (interpolated in Python)
+      height_position_ids  [N]
+      width_position_ids   [N]
+    Output:
+      hidden_states        [1, N, D_vision]   (post_layernorm + pre_norm applied)
+    """
+    def __init__(self, model, h: int, w: int):
+        super().__init__()
+        emb = model.visual.vision_model.embeddings
+        self.patch_embedding = emb.patch_embedding
+        self.encoder = model.visual.vision_model.encoder
+        self.post_layernorm = model.visual.vision_model.post_layernorm
+        self.pre_norm = model.mlp_AR.pre_norm
+        self._image_grid_thw = [(1, h, w)]
+
+    def forward(self, pixel_values, pos_embed, height_position_ids, width_position_ids):
+        patch_embeds = self.patch_embedding(pixel_values)        # [1, D, H', W']
+        embeddings = patch_embeds.flatten(2).transpose(1, 2)      # [1, N, D]
+        embeddings = embeddings + pos_embed
+        seq_len = embeddings.shape[1]
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=embeddings.device)
+        outputs = self.encoder(
+            embeddings,
+            attention_mask=None,
+            use_rope=True,
+            height_position_ids=height_position_ids,
+            width_position_ids=width_position_ids,
+            image_grid_thw=self._image_grid_thw,
+            cu_seqlens=cu_seqlens,
+        )
+        hidden = self.post_layernorm(outputs[0])
+        return self.pre_norm(hidden)
+
+
 # ─────────────────────── VL-1.5 patch-level wrappers ──────────────────────
 
 class VisionPatchEmbedWrapper15(torch.nn.Module):
@@ -497,14 +543,12 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
     """Convert PaddleOCR-VL-1.5 to OpenVINO format using the same whole-image
     interface as VL v1.
 
-    Vision pipeline (identical to VL v1):
-      pixel_values [1, 3, H, W]
-        → vision_patch_embed.xml  → [1, D, H', W']
-        → flatten + add position embedding (Python)
-        → vision_encoder.xml      → [1, N, D_vision]
-        → projector_prenorm.xml   → [1, N, D_vision]
+    Vision pipeline (merged into 2 models):
+      pixel_values [1, 3, H, W] + pos_embed (interpolated in Python) + h/w pos ids
+        → vision_encoder.xml  (patch_embed + flatten + add pos_embed + encoder
+                               + post_layernorm + projector pre_norm) → [1, N, D_vision]
         → spatial 2×2 merge (Python)
-        → projector_mlp.xml       → [1, N_out, D_text]
+        → projector.xml       → [1, N_out, D_text]
 
     Normalization: mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5] (from preprocessor_config.json).
     """
@@ -541,66 +585,41 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
     print(f"  hidden_size={hidden_size}, vision_hidden={vision_hidden}")
     print(f"  num_layers={num_layers}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
 
-    # 1. Vision Patch Embed  [1, 3, H, W] → [1, D, H', W']
-    out_file = output_dir / "vision_patch_embed.xml"
-    if skip_existing and out_file.exists():
-        print("⏭  vision_patch_embed exists, skipping")
-    else:
-        print("Exporting Vision Patch Embedding (whole-image) ...")
-        wrapper = VisionPatchEmbedWrapper(model)
-        ov_model = ov.convert_model(
-            wrapper,
-            example_input=torch.randn(1, 3, 224, 224),
-            input=[("pixel_values", ov.PartialShape([1, 3, -1, -1]))]
-        )
-        _save_ov(ov_model, out_file, precision)
-        print("  Saved vision_patch_embed.xml")
-
-    # 2. Vision Encoder  [1, N, D] → [1, N, D]
+    # 1. Vision Encoder (MERGED: patch_embed + flatten + add pos_embed +
+    #    encoder + post_layernorm + projector pre_norm) → one vision_encoder.xml
+    #    Inputs: pixel_values [1,3,H,W], pos_embed [1,N,D], h/w position ids [N]
     out_file = output_dir / "vision_encoder.xml"
     if skip_existing and out_file.exists():
         print("⏭  vision_encoder exists, skipping")
     else:
-        print("Exporting Vision Encoder ...")
+        print("Exporting Vision Encoder (merged patch_embed + encoder + prenorm) ...")
         H, W = 16, 16
-        wrapper = VisionEncoderWrapper(model, seq_len=H * W, h=H, w=W)
+        N = H * W
+        wrapper = VisionMergedWrapper15(model, h=H, w=W)
         ov_model = ov.convert_model(
             wrapper,
             example_input=(
-                torch.randn(1, H * W, vision_hidden),
-                torch.zeros(H * W, dtype=torch.long),
-                torch.zeros(H * W, dtype=torch.long),
+                torch.randn(1, 3, 224, 224),
+                torch.randn(1, N, vision_hidden),
+                torch.zeros(N, dtype=torch.long),
+                torch.zeros(N, dtype=torch.long),
             ),
             input=[
-                ("hidden_states", ov.PartialShape([1, -1, vision_hidden])),
+                ("pixel_values", ov.PartialShape([1, 3, -1, -1])),
+                ("pos_embed", ov.PartialShape([1, -1, vision_hidden])),
                 ("height_position_ids", ov.PartialShape([-1])),
                 ("width_position_ids", ov.PartialShape([-1])),
             ]
         )
         _save_ov(ov_model, out_file, precision)
-        print("  Saved vision_encoder.xml")
+        print("  Saved vision_encoder.xml (merged)")
 
-    # 3. Projector PreNorm  [1, N, D] → [1, N, D]
-    out_file = output_dir / "projector_prenorm.xml"
+    # 2. Projector  [1, N_out, D*4] → [1, N_out, D_text]  (linear1 + act + linear2)
+    out_file = output_dir / "projector.xml"
     if skip_existing and out_file.exists():
-        print("⏭  projector_prenorm exists, skipping")
+        print("⏭  projector exists, skipping")
     else:
-        print("Exporting Projector PreNorm ...")
-        wrapper = ProjectorPreNormWrapper(model)
-        ov_model = ov.convert_model(
-            wrapper,
-            example_input=torch.randn(1, 256, vision_hidden),
-            input=[("x", ov.PartialShape([1, -1, vision_hidden]))]
-        )
-        _save_ov(ov_model, out_file, precision)
-        print("  Saved projector_prenorm.xml")
-
-    # 4. Projector MLP  [1, N_out, D*4] → [1, N_out, D_text]
-    out_file = output_dir / "projector_mlp.xml"
-    if skip_existing and out_file.exists():
-        print("⏭  projector_mlp exists, skipping")
-    else:
-        print("Exporting Projector MLP ...")
+        print("Exporting Projector ...")
         wrapper = ProjectorMLPWrapper(model)
         ov_model = ov.convert_model(
             wrapper,
@@ -608,7 +627,7 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
             input=[("x", ov.PartialShape([1, -1, projector_in]))]
         )
         _save_ov(ov_model, out_file, precision)
-        print("  Saved projector_mlp.xml")
+        print("  Saved projector.xml")
 
     # 5–7. text_embed, text_decoder, lm_head, tokenizer/detokenizer
     _export_common(model, output_dir, tokenizer, skip_existing,

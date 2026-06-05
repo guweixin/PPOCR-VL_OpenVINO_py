@@ -795,10 +795,19 @@ class PaddleOCRVLPipeline:
         print(f"Loading VL models from {self.model_dir} ...")
         md = self.model_dir
         cfg = _COMPILE_CONFIG
-        self.vision_patch_embed = self.core.compile_model(str(md / "vision_patch_embed.xml"), device_name, cfg)
-        self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name, cfg)
-        self.projector_prenorm = self.core.compile_model(str(md / "projector_prenorm.xml"), device_name, cfg)
-        self.projector_mlp = self.core.compile_model(str(md / "projector_mlp.xml"), device_name, cfg)
+        # Two vision layouts are supported:
+        #   merged  : vision_encoder.xml (patch_embed+encoder+prenorm) + projector.xml
+        #   legacy  : vision_patch_embed + vision_encoder + projector_prenorm + projector_mlp
+        # Detected by the absence of vision_patch_embed.xml.
+        self._merged_vision = not (md / "vision_patch_embed.xml").exists()
+        if self._merged_vision:
+            self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name, cfg)
+            self.projector = self.core.compile_model(str(md / "projector.xml"), device_name, cfg)
+        else:
+            self.vision_patch_embed = self.core.compile_model(str(md / "vision_patch_embed.xml"), device_name, cfg)
+            self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name, cfg)
+            self.projector_prenorm = self.core.compile_model(str(md / "projector_prenorm.xml"), device_name, cfg)
+            self.projector_mlp = self.core.compile_model(str(md / "projector_mlp.xml"), device_name, cfg)
         self.text_embed = self.core.compile_model(str(md / "text_embed.xml"), device_name, cfg)
         self.text_decoder = self.core.compile_model(str(md / "text_decoder.xml"), device_name, cfg)
         self.lm_head = self.core.compile_model(str(md / "lm_head.xml"), device_name, cfg)
@@ -810,11 +819,21 @@ class PaddleOCRVLPipeline:
         n_dec_in = len(self.text_decoder.inputs)
         self._is_stateful = (n_dec_in == 3)
         self._decode_debug = os.environ.get("PPOCR_DECODE_DEBUG", "0") == "1"
-        print(f"  Vision pipeline: whole-image | text_decoder inputs={n_dec_in} "
+        vmode = "merged(2)" if self._merged_vision else "legacy(4)"
+        print(f"  Vision pipeline: whole-image {vmode} | text_decoder inputs={n_dec_in} "
               f"({'stateful' if self._is_stateful else 'legacy'})")
 
+    def _spatial_merge(self, hidden_states, h, w):
+        """2×2 spatial merge: [1, N, D] → [1, N/4, D*4]."""
+        p1 = p2 = self.spatial_merge_size
+        h_new = h // p1
+        w_new = w // p2
+        hidden_states = hidden_states.view(1, h_new, p1, w_new, p2, -1)
+        hidden_states = hidden_states.permute(0, 1, 3, 2, 4, 5)
+        return hidden_states.reshape(1, h_new * w_new, p1 * p2 * hidden_states.shape[-1])
+
     def _encode_image_v1(self, pixel_values, grid_thw):
-        """Whole-image encode path (used by both VL v1 and VL-1.5)."""
+        """Whole-image encode path (used by both VL v1 and legacy-layout VL-1.5)."""
         patch_embeds = torch.tensor(self.vision_patch_embed([pixel_values])[0])
         B, D, H, W = patch_embeds.shape
         embeddings = patch_embeds.flatten(2).transpose(1, 2)  # [1, H*W, D]
@@ -832,18 +851,33 @@ class PaddleOCRVLPipeline:
         )  # [1, N, D]
 
         hidden_states = torch.tensor(self.projector_prenorm([hidden_states])[0])
-
-        p1 = p2 = self.spatial_merge_size
-        h_new = h // p1
-        w_new = w // p2
-        hidden_states = hidden_states.view(1, h_new, p1, w_new, p2, -1)
-        hidden_states = hidden_states.permute(0, 1, 3, 2, 4, 5)
-        hidden_states = hidden_states.reshape(1, h_new * w_new, p1 * p2 * hidden_states.shape[-1])
-
+        hidden_states = self._spatial_merge(hidden_states, h, w)
         image_embeds = torch.tensor(self.projector_mlp([hidden_states])[0])
         return image_embeds[0]  # [SeqLen, D_text]
 
+    def _encode_image_merged(self, pixel_values, grid_thw):
+        """Merged-layout encode path (VL-1.5): vision_encoder.xml fuses
+        patch_embed + flatten + add pos_embed + encoder + prenorm. Numerically
+        identical to _encode_image_v1; pos-embed interpolation and the 2×2 merge
+        stay in Python."""
+        t, h, w = grid_thw
+        pos_embed = interpolate_pos_encoding(self.position_embedding, h, w, self.patch_size)
+
+        image_pids = torch.arange(t * h * w) % (h * w)
+        height_position_ids = image_pids // w
+        width_position_ids = image_pids % w
+
+        hidden_states = torch.tensor(
+            self.vision_encoder([pixel_values, pos_embed, height_position_ids, width_position_ids])[0]
+        )  # [1, N, D] (post_layernorm + pre_norm already applied in-graph)
+
+        hidden_states = self._spatial_merge(hidden_states, h, w)
+        image_embeds = torch.tensor(self.projector([hidden_states])[0])
+        return image_embeds[0]  # [SeqLen, D_text]
+
     def encode_image(self, pixel_values, grid_thw=None, **_):
+        if self._merged_vision:
+            return self._encode_image_merged(pixel_values, grid_thw)
         return self._encode_image_v1(pixel_values, grid_thw)
     def generate(self, image_path, task="ocr"):
         prompt = PROMPTS[task]
