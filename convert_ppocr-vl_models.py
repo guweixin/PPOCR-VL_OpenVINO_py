@@ -40,6 +40,34 @@ DEFAULT_PRECISION = "fp16"
 
 _INT8_WARNED = False
 
+# Files written by tokenizer.save_pretrained / config.save_pretrained that the
+# OpenVINO inference pipeline never reads. They are pruned at the end of export
+# to keep the model dir lean. Inference uses tokenizer.xml/.bin + detokenizer +
+# tokenizer_config.json + added_tokens.json + config.json + position_embedding.npy.
+_REDUNDANT_FILES = (
+    "tokenizer.json",                  # HF fast-tokenizer; replaced by tokenizer.xml/.bin
+    "tokenizer.model",                 # sentencepiece; replaced by OV tokenizer
+    "special_tokens_map.json",         # not read by inference
+    "chat_template.jinja",             # prompt is built in code
+    "configuration_paddleocr_vl.py",   # HF model definition; OV path doesn't use it
+    "packing_position_embedding.npy",  # only position_embedding.npy is used
+)
+
+
+def _prune_redundant_files(output_dir: Path):
+    """Delete files not used by the OpenVINO inference pipeline."""
+    removed = []
+    for name in _REDUNDANT_FILES:
+        f = output_dir / name
+        if f.exists():
+            try:
+                f.unlink()
+                removed.append(name)
+            except OSError:
+                pass
+    if removed:
+        print(f"  🧹 Pruned redundant files: {', '.join(removed)}")
+
 
 def _save_ov(ov_model, out_file: Path, precision: str = DEFAULT_PRECISION):
     """Save an OpenVINO model as fp16 (default), fp32, or int8 weights."""
@@ -521,16 +549,15 @@ def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = Tr
 
     # 8. Position Embeddings (VL v1 uses interpolated pos embed in Python)
     pos_file = output_dir / "position_embedding.npy"
-    packing_pos_file = output_dir / "packing_position_embedding.npy"
-    if skip_existing and pos_file.exists() and packing_pos_file.exists():
+    if skip_existing and pos_file.exists():
         print("⏭  position_embedding.npy 已存在，跳过")
     else:
         print("保存 Position Embeddings ...")
         emb = model.visual.vision_model.embeddings
         np.save(pos_file, emb.position_embedding.weight.detach().cpu().numpy())
-        np.save(packing_pos_file, emb.packing_position_embedding.weight.detach().cpu().numpy())
-        print("  ✅ position_embedding.npy / packing_position_embedding.npy 已保存")
+        print("  ✅ position_embedding.npy 已保存")
 
+    _prune_redundant_files(output_dir)
     print(f"\n✅ VL (v1) 转换完成: {output_dir}")
     del model
 
@@ -636,16 +663,15 @@ def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = 
 
     # 8. Position embeddings (used by the Python inference code for interpolation)
     pos_file = output_dir / "position_embedding.npy"
-    packing_pos_file = output_dir / "packing_position_embedding.npy"
-    if skip_existing and pos_file.exists() and packing_pos_file.exists():
+    if skip_existing and pos_file.exists():
         print("⏭  position embeddings exist, skipping")
     else:
         print("Saving position embeddings ...")
         emb = model.visual.vision_model.embeddings
         np.save(pos_file, emb.position_embedding.weight.detach().cpu().numpy())
-        np.save(packing_pos_file, emb.packing_position_embedding.weight.detach().cpu().numpy())
-        print("  Saved position_embedding.npy / packing_position_embedding.npy")
+        print("  Saved position_embedding.npy")
 
+    _prune_redundant_files(output_dir)
     print(f"\n✅ VL-1.5 (whole-image) conversion done: {output_dir}")
     del model
 
