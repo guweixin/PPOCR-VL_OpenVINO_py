@@ -8,3 +8,7 @@ __pycache__/
 # Output / debug artifacts
 output/
 *.log
+
+# Local-only helper scripts
+upload_to_modelscope.py
+_wsl_probe.sh
