@@ -50,7 +50,7 @@ PP-OCR-OV-models/            ← converted OpenVINO IR (auto-created by conversi
 | Env        | Used for                                                                      |
 | ---------- | ----------------------------------------------------------------------------- |
 | `ppocr-vl` | Model conversion (PyTorch + OpenVINO + openvino-tokenizers)                   |
-| `GLM-OCR`  | Inference (OpenVINO 2026.1 + transformers ≥ 5.8.1 for V3 layout post-process) |
+| `ppocr-vl-infer`  | Inference (OpenVINO 2026.1 + transformers ≥ 5.8.1 for V3 layout post-process) |
 
 
 ---
@@ -109,7 +109,7 @@ Output: `PP-OCR-OV-models/PP-DocLayoutV2-ov/inference.xml`
 Requires `transformers >= 5.8.1`, `torch`, `onnx`, `onnxscript`.
 
 ```bash
-conda activate GLM-OCR
+conda activate ppocr-vl-infer
 python convert_doclayoutv3_safetensors.py
 
 # Options
@@ -128,7 +128,7 @@ Output: `PP-OCR-OV-models/PP-DocLayoutV3-ov/inference.xml`
 ## Step 2 — Run inference
 
 ```bash
-conda activate GLM-OCR
+conda activate ppocr-vl-infer
 
 # Single image (default: v3_vl15 pipeline)
 python ppocr_vl_pipeline.py --image path/to/image.png
@@ -217,7 +217,7 @@ Normalization per model:
 
 ## Known limitations
 
-- **PP-DocLayoutV3 layout boxes** use a bounding box post-processor from `transformers ≥ 5.8.1` (`PPDocLayoutV3ImageProcessor`), which requires `opencv-python` in the GLM-OCR env.
+- **PP-DocLayoutV3 layout boxes** use a bounding box post-processor from `transformers ≥ 5.8.1` (`PPDocLayoutV3ImageProcessor`), which requires `opencv-python` in the ppocr-vl-infer env.
 - **PP-DocLayoutV2** requires the custom OpenVINO build; it cannot run with pip-installed OpenVINO due to unsupported Paddle ops.
 - Tall narrow crops in vertical Chinese text may show line-order differences vs. the Paddle baseline — this is a model-level characteristic, not a pipeline bug.
 
