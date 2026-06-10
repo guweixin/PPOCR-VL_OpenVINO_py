@@ -1,21 +1,19 @@
 """
-一键转换 PP-OCR-models 下 VL 模型到 OpenVINO 格式，保存到 PP-OCR-OV-models。
+一键转换 PP-OCR-models/PaddleOCR-VL-1.5 到 OpenVINO 格式，保存到 PP-OCR-OV-models。
 包含 OV Tokenizer / Detokenizer 转换。
 
-模型列表：
-  1. PP-OCR-models/PaddleOCR-VL       -> PP-OCR-OV-models/PaddleOCR-VL-ov
-     视觉路径：整图 [1, 3, H, W] → patch_embed → encoder → projector
-  2. PP-OCR-models/PaddleOCR-VL-1.5   -> PP-OCR-OV-models/PaddleOCR-VL-1.5-ov
-     视觉路径（patch-level，与官方 HF 对齐）：
-       pixel_values [N, 3, p, p] + siglip_position_ids [N] → patch_embed15 [N, D]
-       → vision_encoder → mlp_AR (pre_norm + rearrange 2×2 + linear1 + act + linear2)
+  PP-OCR-models/PaddleOCR-VL-1.5   -> PP-OCR-OV-models/PaddleOCR-VL-1.5-ov
+  视觉路径（整图，merged 成 2 个模型）：
+    pixel_values [1, 3, H, W] + pos_embed + h/w pos ids
+      → vision_encoder (patch_embed + encoder + post_layernorm + pre_norm)
+      → 2×2 spatial merge (Python) → projector → [1, N_out, D_text]
 
-PP-DocLayoutV2/V3 转换见 convert_doclayout.py（需自定义编译的 OV）。
+PP-DocLayoutV3 转换见 convert_doclayoutv3_safetensors.py。
 
 运行（ppocr-vl 环境或 WSL paddle_env）：
-  python convert_ppocr-vl_models.py [--force] [--only-vl1 | --only-vl15]
-  # Recommended "smaller-but-safe" experiment: int8 vision, fp16 text
-  python convert_ppocr-vl_models.py --force --only-vl15 --vision-precision int8 --text-precision fp16
+  python convert_ppocr-vl_models.py [--force]
+  # Recommended "smaller-but-safe" experiment: int8 decoder, fp16 elsewhere
+  python convert_ppocr-vl_models.py --force --int8-decoder
 """
 
 import torch
@@ -123,59 +121,10 @@ def _make_decoder_stateful(ov_model, num_layers: int):
     ov_model.validate_nodes_and_infer_types()
     return ov_model
 
-# ─────────────────────────── VL (v1) wrappers ─────────────────────────────
-
-class VisionPatchEmbedWrapper(torch.nn.Module):
-    """VL v1: whole-image input [1, 3, H, W] → [1, D, H', W']"""
-    def __init__(self, model):
-        super().__init__()
-        self.patch_embedding = model.visual.vision_model.embeddings.patch_embedding
-
-    def forward(self, pixel_values):
-        return self.patch_embedding(pixel_values)
-
-
-class VisionEncoderWrapper(torch.nn.Module):
-    """VL v1: encoder wrapper - same interface as VL-1.5."""
-    def __init__(self, model, seq_len: int, h: int, w: int):
-        super().__init__()
-        self.encoder = model.visual.vision_model.encoder
-        self.post_layernorm = model.visual.vision_model.post_layernorm
-        self._image_grid_thw = [(1, h, w)]
-
-    def forward(self, hidden_states, height_position_ids, width_position_ids):
-        seq_len = hidden_states.shape[1]
-        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=hidden_states.device)
-        outputs = self.encoder(
-            hidden_states,
-            attention_mask=None,
-            use_rope=True,
-            height_position_ids=height_position_ids,
-            width_position_ids=width_position_ids,
-            image_grid_thw=self._image_grid_thw,
-            cu_seqlens=cu_seqlens,
-        )
-        return self.post_layernorm(outputs[0])
-
-
-class VisionEncoderWrapper15(torch.nn.Module):
-    """Alias for VisionEncoderWrapper – kept for compatibility."""
-    def __new__(cls, model, seq_len: int, h: int, w: int):
-        return VisionEncoderWrapper(model, seq_len=seq_len, h=h, w=w)
-
-
-class ProjectorPreNormWrapper(torch.nn.Module):
-    """VL v1: pre-norm only, input [1, N, D_vision]"""
-    def __init__(self, model):
-        super().__init__()
-        self.pre_norm = model.mlp_AR.pre_norm
-
-    def forward(self, x):
-        return self.pre_norm(x)
-
+# ─────────────────────────── VL-1.5 wrappers ──────────────────────────────
 
 class ProjectorMLPWrapper(torch.nn.Module):
-    """VL v1: linear_1 + act + linear_2, input [1, N, D_vision*4]"""
+    """linear_1 + act + linear_2, input [1, N, D_vision*4] → [1, N, D_text]."""
     def __init__(self, model):
         super().__init__()
         self.linear_1 = model.mlp_AR.linear_1
@@ -446,129 +395,12 @@ def _export_common(model, output_dir, tokenizer, skip_existing,
         print(f"  ✅ lm_head.xml 已保存 ({decoder_precision})")
 
 
-# ─────────────────────── VL (v1) conversion ───────────────────────────────
-
-def convert_vl_model(model_path: str, output_dir: Path, skip_existing: bool = True,
-                     precision: str = DEFAULT_PRECISION, stateful: bool = False,
-                     decoder_precision: str = None):
-    """转换 PaddleOCR-VL (v1, 整图接口) 到 OpenVINO 格式。"""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n{'='*60}\n转换 VL (v1) 模型: {model_path}\n输出: {output_dir}\n{'='*60}")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=True, torch_dtype=torch.float32,
-        attn_implementation="eager",   # avoids is_causal dynamic bool in SDPA
-    ).cpu().eval()
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    tokenizer.save_pretrained(output_dir)
-    model.config.save_pretrained(output_dir)
-
-    num_layers = model.config.num_hidden_layers
-    num_kv_heads = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
-    head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
-    hidden_size = model.config.hidden_size
-    vision_hidden = model.visual.vision_model.config.hidden_size
-    projector_in = vision_hidden * 4
-
-    print(f"  hidden_size={hidden_size}, vision_hidden={vision_hidden}")
-    print(f"  num_layers={num_layers}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
-
-    # 1. Vision Patch Embedding (whole image)
-    out_file = output_dir / "vision_patch_embed.xml"
-    if skip_existing and out_file.exists():
-        print("⏭  vision_patch_embed 已存在，跳过")
-    else:
-        print("导出 Vision Patch Embedding ...")
-        wrapper = VisionPatchEmbedWrapper(model)
-        ov_model = ov.convert_model(
-            wrapper,
-            example_input=torch.randn(1, 3, 224, 224),
-            input=[("pixel_values", ov.PartialShape([1, 3, -1, -1]))]
-        )
-        _save_ov(ov_model, out_file, precision)
-        print("  ✅ vision_patch_embed.xml 已保存")
-
-    # 2. Vision Encoder
-    out_file = output_dir / "vision_encoder.xml"
-    if skip_existing and out_file.exists():
-        print("⏭  vision_encoder 已存在，跳过")
-    else:
-        print("导出 Vision Encoder ...")
-        H, W = 16, 16
-        wrapper = VisionEncoderWrapper(model, seq_len=H * W, h=H, w=W)
-        ov_model = ov.convert_model(
-            wrapper,
-            example_input=(
-                torch.randn(1, H * W, vision_hidden),
-                torch.zeros(H * W, dtype=torch.long),
-                torch.zeros(H * W, dtype=torch.long),
-            ),
-            input=[
-                ("hidden_states", ov.PartialShape([1, -1, vision_hidden])),
-                ("height_position_ids", ov.PartialShape([-1])),
-                ("width_position_ids", ov.PartialShape([-1])),
-            ]
-        )
-        _save_ov(ov_model, out_file, precision)
-        print("  ✅ vision_encoder.xml 已保存")
-
-    # 3. Projector PreNorm
-    out_file = output_dir / "projector_prenorm.xml"
-    if skip_existing and out_file.exists():
-        print("⏭  projector_prenorm 已存在，跳过")
-    else:
-        print("导出 Projector PreNorm ...")
-        wrapper = ProjectorPreNormWrapper(model)
-        ov_model = ov.convert_model(
-            wrapper,
-            example_input=torch.randn(1, 256, vision_hidden),
-            input=[("x", ov.PartialShape([1, -1, vision_hidden]))]
-        )
-        _save_ov(ov_model, out_file, precision)
-        print("  ✅ projector_prenorm.xml 已保存")
-
-    # 4. Projector MLP
-    out_file = output_dir / "projector_mlp.xml"
-    if skip_existing and out_file.exists():
-        print("⏭  projector_mlp 已存在，跳过")
-    else:
-        print("导出 Projector MLP ...")
-        wrapper = ProjectorMLPWrapper(model)
-        ov_model = ov.convert_model(
-            wrapper,
-            example_input=torch.randn(1, 256, projector_in),
-            input=[("x", ov.PartialShape([1, -1, projector_in]))]
-        )
-        _save_ov(ov_model, out_file, precision)
-        print("  ✅ projector_mlp.xml 已保存")
-
-    # 5–7. Common: text_embed, text_decoder, lm_head, tokenizer
-    _export_common(model, output_dir, tokenizer, skip_existing,
-                   num_layers, num_kv_heads, head_dim, hidden_size, precision, stateful,
-                   decoder_precision)
-
-    # 8. Position Embeddings (VL v1 uses interpolated pos embed in Python)
-    pos_file = output_dir / "position_embedding.npy"
-    if skip_existing and pos_file.exists():
-        print("⏭  position_embedding.npy 已存在，跳过")
-    else:
-        print("保存 Position Embeddings ...")
-        emb = model.visual.vision_model.embeddings
-        np.save(pos_file, emb.position_embedding.weight.detach().cpu().numpy())
-        print("  ✅ position_embedding.npy 已保存")
-
-    _prune_redundant_files(output_dir)
-    print(f"\n✅ VL (v1) 转换完成: {output_dir}")
-    del model
-
-
 # ─────────────────────── VL-1.5 whole-image conversion ────────────────────
 
 def convert_vl15_model(model_path: str, output_dir: Path, skip_existing: bool = True,
                        precision: str = DEFAULT_PRECISION, stateful: bool = False,
                        decoder_precision: str = None):
-    """Convert PaddleOCR-VL-1.5 to OpenVINO format using the same whole-image
-    interface as VL v1.
+    """Convert PaddleOCR-VL-1.5 to OpenVINO format (whole-image interface).
 
     Vision pipeline (merged into 2 models):
       pixel_values [1, 3, H, W] + pos_embed (interpolated in Python) + h/w pos ids
@@ -705,8 +537,6 @@ def main():
 
     force = "--force" in sys.argv
     skip_existing = not force
-    only_v1 = "--only-vl1" in sys.argv
-    only_v15 = "--only-vl15" in sys.argv
 
     # --precision {fp32,fp16}  (default fp16). Accepts "--precision fp32" or "--precision=fp32".
     precision = DEFAULT_PRECISION
@@ -739,28 +569,17 @@ def main():
     print(f"decoder/lm_head precision = {decoder_precision}  (--int8-decoder 开启 int8)")
     print(f"stateful decoder = {stateful}  (默认 stateful；--legacy-decoder 回退显式 KV)")
 
-    if not only_v15:
-        convert_vl_model(
-            model_path=str(base / "PaddleOCR-VL"),
-            output_dir=out_base / "PaddleOCR-VL-ov",
-            skip_existing=skip_existing,
-            precision=precision,
-            stateful=stateful,
-            decoder_precision=decoder_precision,
-        )
-
-    if not only_v1:
-        convert_vl15_model(
-            model_path=str(base / "PaddleOCR-VL-1.5"),
-            output_dir=out_base / "PaddleOCR-VL-1.5-ov",
-            skip_existing=skip_existing,
-            precision=precision,
-            stateful=stateful,
-            decoder_precision=decoder_precision,
-        )
+    convert_vl15_model(
+        model_path=str(base / "PaddleOCR-VL-1.5"),
+        output_dir=out_base / "PaddleOCR-VL-1.5-ov",
+        skip_existing=skip_existing,
+        precision=precision,
+        stateful=stateful,
+        decoder_precision=decoder_precision,
+    )
 
     print("\n" + "=" * 60)
-    print("🎉 所有模型转换完成！")
+    print("🎉 PaddleOCR-VL-1.5 转换完成！")
     print("=" * 60)
 
 

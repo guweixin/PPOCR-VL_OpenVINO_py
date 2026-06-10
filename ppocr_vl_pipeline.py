@@ -8,7 +8,6 @@ except ImportError as _e:  # pragma: no cover - surfaced clearly at runtime
     _OV_TOKENIZERS_IMPORT_ERROR = _e
 import numpy as np
 import cv2
-import yaml
 import json
 import time
 import torch
@@ -43,14 +42,7 @@ def _make_core() -> "ov.Core":
     return core
 
 PIPELINE_PRESETS = {
-    # PP-DocLayoutV2 + PaddleOCR-VL
-    "v2_vl": {
-        "layout_subdir": "PP-DocLayoutV2-ov",
-        "vl_subdir": "PaddleOCR-VL-ov",
-        "layout_kind": "v2",
-        "title": "PP-DocLayoutV2 + PaddleOCR-VL",
-    },
-    # PP-DocLayoutV3 + PaddleOCR-VL-1.5 (default)
+    # PP-DocLayoutV3 + PaddleOCR-VL-1.5
     "v3_vl15": {
         "layout_subdir": "PP-DocLayoutV3-ov",
         "vl_subdir": "PaddleOCR-VL-1.5-ov",
@@ -643,7 +635,7 @@ def process_image(image_input, patch_size: int, image_mean=None, image_std=None,
                   min_pixels: int = VL_MIN_PIXELS, max_pixels: int = VL_MAX_PIXELS,
                   merge_size: int = 2, resample: int = Image.BICUBIC,
                   rescale_factor: float = 1.0 / 255.0):
-    """VL v1 whole-image preprocessing.
+    """Whole-image preprocessing (PaddleOCR-VL-1.5).
     Returns pixel_values [1, 3, H, W], grid_thw (1, H//p, W//p).
     min_pixels/max_pixels control the vision-encoder pixel budget and must match
     the official preprocessor (VL_MIN_PIXELS/VL_MAX_PIXELS) for accuracy parity.
@@ -662,75 +654,13 @@ def process_image(image_input, patch_size: int, image_mean=None, image_std=None,
     image = image.resize((new_w, new_h), resample)
 
     if image_mean is None:
-        image_mean = [0.48145466, 0.4578275, 0.40821073]  # VL v1: CLIP norm
-    if image_std is None:
-        image_std = [0.26862954, 0.26130258, 0.27577711]
-
-    image_np = _normalize_image(image, image_mean, image_std, rescale_factor).transpose(2, 0, 1)
-    return torch.tensor(image_np).unsqueeze(0), (1, new_h // patch_size, new_w // patch_size)
-
-
-def process_image_patches(image_input, patch_size: int, image_mean=None, image_std=None,
-                           merge_size: int = 2):
-    """VL-1.5 patch-level preprocessing.
-    Ensures H and W are divisible by patch_size * merge_size so the 2×2
-    spatial rearrange in _encode_image_v15 always works.
-    Small crops are upscaled so that each dimension spans at least
-    4×patch_size pixels (≥ 2 merge-units), preserving text legibility.
-    Returns:
-        pixel_values  [N_patches, 3, patch_size, patch_size]
-        siglip_pos_ids [N_patches]
-        image_grid_thw  (T=1, H_grid, W_grid)
-    """
-    if isinstance(image_input, str):
-        image = Image.open(image_input).convert("RGB")
-    elif isinstance(image_input, Image.Image):
-        image = image_input.convert("RGB")
-    else:
-        raise ValueError("image_input must be a file path or PIL Image object")
-
-    if image_mean is None:
         image_mean = [0.5, 0.5, 0.5]
     if image_std is None:
         image_std = [0.5, 0.5, 0.5]
 
-    w, h = image.size
-    step = patch_size * merge_size  # 28
+    image_np = _normalize_image(image, image_mean, image_std, rescale_factor).transpose(2, 0, 1)
+    return torch.tensor(image_np).unsqueeze(0), (1, new_h // patch_size, new_w // patch_size)
 
-    # Minimum grid size: at least 4 patches per side (2 merge-units each side),
-    # so each dimension must be at least 4 * patch_size = 56 px before patchify.
-    # Upscale if the crop is too small to fit enough patches.
-    min_side_px = 4 * patch_size  # 56
-    if h < min_side_px or w < min_side_px:
-        scale = max(min_side_px / h, min_side_px / w)
-        new_h_pre = max(min_side_px, round(h * scale))
-        new_w_pre = max(min_side_px, round(w * scale))
-        image = image.resize((new_w_pre, new_h_pre), Image.BICUBIC)
-        w, h = image.size
-
-    # Resize so both H and W are divisible by step = patch_size * merge_size
-    new_h, new_w = smart_resize(h, w, factor=step)
-    image = image.resize((new_w, new_h), Image.BICUBIC)
-
-    h_grid = new_h // patch_size
-    w_grid = new_w // patch_size
-
-    arr_img = np.array(image).astype(np.float32) / 255.0
-    mean_np = np.array(image_mean, dtype=np.float32)
-    std_np = np.array(image_std, dtype=np.float32)
-    arr_img = (arr_img - mean_np) / std_np  # [H, W, 3]
-
-    patches = arr_img.reshape(h_grid, patch_size, w_grid, patch_size, 3)
-    patches = patches.transpose(0, 2, 4, 1, 3).reshape(-1, 3, patch_size, patch_size)
-
-    N = h_grid * w_grid
-    siglip_pos_ids = np.arange(N, dtype=np.int64) % N
-
-    pixel_values = torch.tensor(patches, dtype=torch.float32)
-    siglip_pos_ids = torch.tensor(siglip_pos_ids, dtype=torch.long)
-    image_grid_thw = (1, h_grid, w_grid)
-
-    return pixel_values, siglip_pos_ids, image_grid_thw
 
 def interpolate_pos_encoding(position_embedding, height, width, patch_size):
     # position_embedding: [NumPositions, Dim]
@@ -916,19 +846,11 @@ class PaddleOCRVLPipeline:
         print(f"Loading VL models from {self.model_dir} ...")
         md = self.model_dir
         cfg = _COMPILE_CONFIG
-        # Two vision layouts are supported:
-        #   merged  : vision_encoder.xml (patch_embed+encoder+prenorm) + projector.xml
-        #   legacy  : vision_patch_embed + vision_encoder + projector_prenorm + projector_mlp
-        # Detected by the absence of vision_patch_embed.xml.
-        self._merged_vision = not (md / "vision_patch_embed.xml").exists()
-        if self._merged_vision:
-            self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name, cfg)
-            self.projector = self.core.compile_model(str(md / "projector.xml"), device_name, cfg)
-        else:
-            self.vision_patch_embed = self.core.compile_model(str(md / "vision_patch_embed.xml"), device_name, cfg)
-            self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name, cfg)
-            self.projector_prenorm = self.core.compile_model(str(md / "projector_prenorm.xml"), device_name, cfg)
-            self.projector_mlp = self.core.compile_model(str(md / "projector_mlp.xml"), device_name, cfg)
+        # PaddleOCR-VL-1.5 merged vision graph: vision_encoder.xml fuses
+        # patch_embed + encoder + post_layernorm + projector pre_norm; projector.xml
+        # is the MLP after the 2×2 spatial merge (done in Python).
+        self.vision_encoder = self.core.compile_model(str(md / "vision_encoder.xml"), device_name, cfg)
+        self.projector = self.core.compile_model(str(md / "projector.xml"), device_name, cfg)
         self.text_embed = self.core.compile_model(str(md / "text_embed.xml"), device_name, cfg)
         self.text_decoder = self.core.compile_model(str(md / "text_decoder.xml"), device_name, cfg)
         self.lm_head = self.core.compile_model(str(md / "lm_head.xml"), device_name, cfg)
@@ -946,8 +868,7 @@ class PaddleOCRVLPipeline:
         n_dec_in = len(self.text_decoder.inputs)
         self._is_stateful = (n_dec_in == 3)
         self._decode_debug = os.environ.get("PPOCR_DECODE_DEBUG", "0") == "1"
-        vmode = "merged(2)" if self._merged_vision else "legacy(4)"
-        print(f"  Vision pipeline: whole-image {vmode} | text_decoder inputs={n_dec_in} "
+        print(f"  Vision pipeline: whole-image merged | text_decoder inputs={n_dec_in} "
               f"({'stateful' if self._is_stateful else 'legacy'})")
 
     def _spatial_merge(self, hidden_states, h, w):
@@ -959,34 +880,10 @@ class PaddleOCRVLPipeline:
         hidden_states = hidden_states.permute(0, 1, 3, 2, 4, 5)
         return hidden_states.reshape(1, h_new * w_new, p1 * p2 * hidden_states.shape[-1])
 
-    def _encode_image_v1(self, pixel_values, grid_thw):
-        """Whole-image encode path (used by both VL v1 and legacy-layout VL-1.5)."""
-        patch_embeds = torch.tensor(self.vision_patch_embed([pixel_values])[0])
-        B, D, H, W = patch_embeds.shape
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)  # [1, H*W, D]
-
-        t, h, w = grid_thw
-        pos_embed = interpolate_pos_encoding(self.position_embedding, h, w, self.patch_size)
-        embeddings = embeddings + pos_embed
-
-        image_pids = torch.arange(t * h * w) % (h * w)
-        height_position_ids = image_pids // w
-        width_position_ids = image_pids % w
-
-        hidden_states = torch.tensor(
-            self.vision_encoder([embeddings, height_position_ids, width_position_ids])[0]
-        )  # [1, N, D]
-
-        hidden_states = torch.tensor(self.projector_prenorm([hidden_states])[0])
-        hidden_states = self._spatial_merge(hidden_states, h, w)
-        image_embeds = torch.tensor(self.projector_mlp([hidden_states])[0])
-        return image_embeds[0]  # [SeqLen, D_text]
-
-    def _encode_image_merged(self, pixel_values, grid_thw):
+    def encode_image(self, pixel_values, grid_thw=None, **_):
         """Merged-layout encode path (VL-1.5): vision_encoder.xml fuses
-        patch_embed + flatten + add pos_embed + encoder + prenorm. Numerically
-        identical to _encode_image_v1; pos-embed interpolation and the 2×2 merge
-        stay in Python."""
+        patch_embed + flatten + add pos_embed + encoder + post_layernorm + prenorm.
+        Pos-embed interpolation and the 2×2 spatial merge stay in Python."""
         t, h, w = grid_thw
         pos_embed = interpolate_pos_encoding(self.position_embedding, h, w, self.patch_size)
 
@@ -1001,11 +898,6 @@ class PaddleOCRVLPipeline:
         hidden_states = self._spatial_merge(hidden_states, h, w)
         image_embeds = torch.tensor(self.projector([hidden_states])[0])
         return image_embeds[0]  # [SeqLen, D_text]
-
-    def encode_image(self, pixel_values, grid_thw=None, **_):
-        if self._merged_vision:
-            return self._encode_image_merged(pixel_values, grid_thw)
-        return self._encode_image_v1(pixel_values, grid_thw)
     def generate(self, image_path, task="ocr", min_pixels: int = None,
                  max_pixels: int = None):
         # Default to the per-model pixel budget read from preprocessor_config.json.
@@ -1015,7 +907,7 @@ class PaddleOCRVLPipeline:
             max_pixels = self.max_pixels
         prompt = PROMPTS[task]
         cfg = self.vl["config"]
-        # 1. Process Image (whole-image path for both VL v1 and VL-1.5)
+        # 1. Process Image (whole-image path)
         pixel_values, grid_thw = process_image(
             image_path, self.patch_size,
             image_mean=self.image_mean, image_std=self.image_std,
@@ -1237,110 +1129,6 @@ def _layout_nms(boxes: list, iou_thresh: float = 0.5, io_min_thresh: float = 0.8
     return keep_boxes
 
 
-class PPDocLayoutV2Pipeline:
-    def __init__(self, model_dir: Path, device_name: str = DEFAULT_DEVICE, verbose: bool = False):
-        self.model_dir = Path(model_dir)
-        self.model_path = self.model_dir / "inference.xml"
-        self.config_path = self.model_dir / "inference.yml"
-        self.device = device_name
-        self.verbose = verbose
-
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"Model not found: {self.model_path}")
-        if not self.config_path.exists():
-            raise FileNotFoundError(f"Config not found: {self.config_path}")
-
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
-
-        self.config_json_path = self.model_dir / "config.json"
-        self.labels = []
-        if self.config_json_path.exists():
-            with open(self.config_json_path, "r", encoding="utf-8") as f:
-                json_config = json.load(f)
-                self.labels = json_config.get("label_list", [])
-        else:
-            print(f"Warning: {self.config_json_path} not found. Class names will be unavailable.")
-
-        self.draw_threshold = self.config.get("draw_threshold", 0.5)
-
-        self.core = _make_core()
-        print(f"[Layout V2] {self.model_path}")
-        self.compiled_model = self.core.compile_model(
-            self.core.read_model(model=str(self.model_path)),
-            device_name=self.device,
-            config=_COMPILE_CONFIG,
-        )
-
-    def preprocess(self, image):
-        # image: cv2 image (BGR)
-        h, w = image.shape[:2]
-        
-        # Resize logic from config (simplified to 800x800 as per original script)
-        target_size = [800, 800]
-        for op in self.config.get('Preprocess', []):
-            if op['type'] == 'Resize':
-                target_size = op.get('target_size', [800, 800])
-                break
-        
-        img_resized = cv2.resize(image, (target_size[0], target_size[1]), interpolation=cv2.INTER_LINEAR)
-        
-        # Normalize (0-1)
-        img_float = img_resized.astype(np.float32) / 255.0
-        
-        # HWC -> CHW
-        img_chw = img_float.transpose(2, 0, 1)
-        
-        # Add batch dim
-        img_batch = img_chw[np.newaxis, :]
-        
-        # Meta info
-        im_shape = np.array([target_size[1], target_size[0]], dtype=np.float32).reshape(1, 2)
-        scale_factor = np.array([target_size[1] / h, target_size[0] / w], dtype=np.float32).reshape(1, 2)
-        
-        return img_batch, im_shape, scale_factor
-
-    def predict(self, image_path):
-        if isinstance(image_path, str):
-            img = cv2.imread(image_path)
-        elif isinstance(image_path, np.ndarray):
-            img = image_path
-        else:
-            raise ValueError("Input must be path or numpy array")
-
-        if img is None:
-            raise ValueError("Failed to load image")
-
-        img_batch, im_shape, scale_factor = self.preprocess(img)
-        results = self.compiled_model(
-            {"image": img_batch, "im_shape": im_shape, "scale_factor": scale_factor}
-        )
-
-        boxes = []
-        if self.verbose:
-            print("\n[Layout V2] Raw outputs:")
-        for output_node, output_data in results.items():
-            if self.verbose:
-                print(f"  {output_node.any_name}: {output_data.shape}")
-            if len(output_data.shape) == 2 and output_data.shape[1] in (6, 8):
-                for row in output_data:
-                    class_id = int(row[0])
-                    score = float(row[1])
-                    if score > self.draw_threshold:
-                        x1, y1, x2, y2 = row[2:6]
-                        reading_order = int(row[6]) if output_data.shape[1] == 8 else 0
-                        boxes.append(
-                            {
-                                "class_id": class_id,
-                                "score": score,
-                                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                                "reading_order": reading_order,
-                            }
-                        )
-
-        return _layout_nms(boxes), img
-
-
 class PPDocLayoutV3Pipeline:
     """PP-DocLayoutV3 OpenVINO (safetensors export) + HF ImageProcessor post-process."""
 
@@ -1449,9 +1237,7 @@ class PPDocLayoutV3Pipeline:
         return self.id2label.get(class_id, f"Class_{class_id}")
 
 
-def create_layout_pipeline(layout_kind: str, model_dir: Path, device: str, verbose: bool = False):
-    if layout_kind == "v2":
-        return PPDocLayoutV2Pipeline(model_dir, device_name=device, verbose=verbose)
+def create_layout_pipeline(layout_kind: str, model_dir: Path, device: str):
     if layout_kind == "v3":
         return PPDocLayoutV3Pipeline(model_dir, device_name=device)
     raise ValueError(f"Unknown layout_kind: {layout_kind}")
@@ -1470,7 +1256,6 @@ def build_pipelines(
     pipeline_name: str = DEFAULT_PIPELINE,
     ov_root: Path = OV_MODELS_ROOT,
     device: str = DEFAULT_DEVICE,
-    verbose_layout: bool = False,
 ):
     if pipeline_name not in PIPELINE_PRESETS:
         raise ValueError(
@@ -1479,9 +1264,7 @@ def build_pipelines(
     preset = PIPELINE_PRESETS[pipeline_name]
     layout_dir = ov_root / preset["layout_subdir"]
     vl_dir = ov_root / preset["vl_subdir"]
-    layout = create_layout_pipeline(
-        preset["layout_kind"], layout_dir, device, verbose=verbose_layout
-    )
+    layout = create_layout_pipeline(preset["layout_kind"], layout_dir, device)
     ocr = PaddleOCRVLPipeline(vl_dir, device_name=device)
     return layout, ocr, preset
 
@@ -1620,7 +1403,6 @@ def run_end_to_end(
     pipeline_name: str = DEFAULT_PIPELINE,
     ov_root: Path = OV_MODELS_ROOT,
     device: str = DEFAULT_DEVICE,
-    verbose_layout: bool = False,
     layout_threshold: float = None,
     debug: bool = False,
     # Pre-built pipelines; if provided, model loading is skipped
@@ -1638,7 +1420,6 @@ def run_end_to_end(
             preset["layout_kind"],
             ov_root / preset["layout_subdir"],
             device,
-            verbose=verbose_layout,
         )
         # Override threshold if explicitly specified
         if layout_threshold is not None:
@@ -1859,12 +1640,7 @@ def main():
         "--layout-threshold",
         type=float,
         default=None,
-        help="Layout detection score threshold (default: 0.5 for V2, 0.3 for V3)",
-    )
-    parser.add_argument(
-        "--verbose-layout",
-        action="store_true",
-        help="Print raw layout model outputs (V2)",
+        help=f"Layout detection score threshold (default: {LAYOUT_V3_SCORE_THRESHOLD})",
     )
     parser.add_argument(
         "--debug",
@@ -1897,7 +1673,6 @@ def main():
         preset["layout_kind"],
         ov_root / preset["layout_subdir"],
         args.device,
-        verbose=args.verbose_layout,
     )
     if args.layout_threshold is not None:
         layout_pipeline.draw_threshold = args.layout_threshold
@@ -1920,7 +1695,6 @@ def main():
                 pipeline_name=args.pipeline,
                 ov_root=ov_root,
                 device=args.device,
-                verbose_layout=args.verbose_layout,
                 layout_threshold=args.layout_threshold,
                 debug=bool(args.debug),
                 layout_pipeline=layout_pipeline,
