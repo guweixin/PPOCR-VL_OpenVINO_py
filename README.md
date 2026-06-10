@@ -46,11 +46,18 @@ PP-OCR-OV-models/            ← converted OpenVINO IR (auto-created by conversi
 
 ## Conda environments
 
+Two **separate** environments are used by design. Conversion is a heavy, one-time step
+that needs the full Paddle framework; inference stays lean and never imports Paddle.
 
-| Env        | Used for                                                                      |
-| ---------- | ----------------------------------------------------------------------------- |
-| `ppocr-vl` | Model conversion (PyTorch + OpenVINO + openvino-tokenizers)                   |
-| `ppocr-vl-infer`  | Inference (OpenVINO 2026.1 + transformers ≥ 5.8.1 for V3 layout post-process) |
+| Env              | Python | Used for         | Key packages                                                                                                      |
+| ---------------- | ------ | ---------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `ppocr-vl`       | 3.10   | Model conversion | `paddlepaddle 3.3.x`, `paddle2onnx`, `onnx`, `openvino 2026.1`, `openvino-tokenizers 2026.1`, `transformers 4.57.x`, `torch`, `sentencepiece` |
+| `ppocr-vl-infer` | 3.13   | Inference        | `openvino 2026.2`, `openvino-tokenizers 2026.2`, `transformers 5.8.x`, `torch` (CPU build ok), `pypdfium2` (PDF), `opencv-python`, `pillow`, `numpy`, `pyyaml` |
+
+> **Why not merge them?** `paddlepaddle` pins the conversion env to Python ≤ 3.12 and
+> `transformers 4.x`, while the inference env runs Python 3.13 with newer OpenVINO and
+> `transformers 5.x`. Since conversion runs only once and the whole point of the OpenVINO
+> port is a Paddle-free runtime, the two are kept apart on purpose.
 
 
 ---
@@ -223,22 +230,34 @@ Normalization per model:
 
 ---
 
-## Dependencies (PPOCR-VL env)
+## Dependencies
+
+Pinned versions live in [`requirements.txt`](requirements.txt). Summary by environment:
+
+**Inference — `ppocr-vl-infer` (Python 3.13)**
 
 ```
-openvino >= 2026.1
-transformers >= 5.8.1
-torch
-opencv-python
-sentencepiece
-pillow
-numpy
-pyyaml
+openvino==2026.2.0
+openvino-tokenizers==2026.2.0.0   # loads tokenizer.xml/detokenizer.xml (replaces sentencepiece)
+transformers==5.8.1               # AutoImageProcessor for PP-DocLayoutV3 layout post-process
+torch==2.12.0                     # CPU build is enough; inference runs on OpenVINO
+torchvision==0.27.0
+opencv-python, pillow, numpy, pyyaml
+pypdfium2==4.30.0                 # only needed for PDF input
 ```
-
-Install:
 
 ```bash
-pip install openvino openvino-tokenizers "transformers>=5.8.1" torch opencv-python sentencepiece pillow numpy pyyaml
+pip install -r requirements.txt   # or, minimal inference set:
+pip install "openvino==2026.2.0" "openvino-tokenizers==2026.2.0.0" "transformers==5.8.1" \
+            torch torchvision opencv-python pillow numpy pyyaml pypdfium2
+```
+
+**Conversion — `ppocr-vl` (Python 3.10)** adds the Paddle export toolchain:
+
+```
+paddlepaddle==3.3.1
+paddle2onnx, onnx, onnxoptimizer
+openvino==2026.1.0, openvino-tokenizers==2026.1.0.0
+transformers==4.57.6, torch==2.12.0, sentencepiece, nncf (optional, for --int8-decoder)
 ```
 
