@@ -662,68 +662,6 @@ def process_image(image_input, patch_size: int, image_mean=None, image_std=None,
     return torch.tensor(image_np).unsqueeze(0), (1, new_h // patch_size, new_w // patch_size)
 
 
-def process_image_patches(image_input, patch_size: int, image_mean=None, image_std=None,
-                           merge_size: int = 2):
-    """VL-1.5 patch-level preprocessing.
-    Ensures H and W are divisible by patch_size * merge_size so the 2×2
-    spatial rearrange in _encode_image_v15 always works.
-    Small crops are upscaled so that each dimension spans at least
-    4×patch_size pixels (≥ 2 merge-units), preserving text legibility.
-    Returns:
-        pixel_values  [N_patches, 3, patch_size, patch_size]
-        siglip_pos_ids [N_patches]
-        image_grid_thw  (T=1, H_grid, W_grid)
-    """
-    if isinstance(image_input, str):
-        image = Image.open(image_input).convert("RGB")
-    elif isinstance(image_input, Image.Image):
-        image = image_input.convert("RGB")
-    else:
-        raise ValueError("image_input must be a file path or PIL Image object")
-
-    if image_mean is None:
-        image_mean = [0.5, 0.5, 0.5]
-    if image_std is None:
-        image_std = [0.5, 0.5, 0.5]
-
-    w, h = image.size
-    step = patch_size * merge_size  # 28
-
-    # Minimum grid size: at least 4 patches per side (2 merge-units each side),
-    # so each dimension must be at least 4 * patch_size = 56 px before patchify.
-    # Upscale if the crop is too small to fit enough patches.
-    min_side_px = 4 * patch_size  # 56
-    if h < min_side_px or w < min_side_px:
-        scale = max(min_side_px / h, min_side_px / w)
-        new_h_pre = max(min_side_px, round(h * scale))
-        new_w_pre = max(min_side_px, round(w * scale))
-        image = image.resize((new_w_pre, new_h_pre), Image.BICUBIC)
-        w, h = image.size
-
-    # Resize so both H and W are divisible by step = patch_size * merge_size
-    new_h, new_w = smart_resize(h, w, factor=step)
-    image = image.resize((new_w, new_h), Image.BICUBIC)
-
-    h_grid = new_h // patch_size
-    w_grid = new_w // patch_size
-
-    arr_img = np.array(image).astype(np.float32) / 255.0
-    mean_np = np.array(image_mean, dtype=np.float32)
-    std_np = np.array(image_std, dtype=np.float32)
-    arr_img = (arr_img - mean_np) / std_np  # [H, W, 3]
-
-    patches = arr_img.reshape(h_grid, patch_size, w_grid, patch_size, 3)
-    patches = patches.transpose(0, 2, 4, 1, 3).reshape(-1, 3, patch_size, patch_size)
-
-    N = h_grid * w_grid
-    siglip_pos_ids = np.arange(N, dtype=np.int64) % N
-
-    pixel_values = torch.tensor(patches, dtype=torch.float32)
-    siglip_pos_ids = torch.tensor(siglip_pos_ids, dtype=torch.long)
-    image_grid_thw = (1, h_grid, w_grid)
-
-    return pixel_values, siglip_pos_ids, image_grid_thw
-
 def interpolate_pos_encoding(position_embedding, height, width, patch_size):
     # position_embedding: [NumPositions, Dim]
     # height, width: Grid size (H_grid, W_grid)
