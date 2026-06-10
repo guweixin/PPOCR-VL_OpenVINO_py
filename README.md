@@ -1,6 +1,6 @@
-# PPOCR-VL OpenVINO
+# PPOCR-VL-1.5 OpenVINO
 
-Run PaddleOCR-VL document parsing pipelines entirely with OpenVINO, on Windows CPU/GPU — no Paddle framework required at inference time.
+Run PaddleOCR-VL-1.5 document parsing pipelines entirely with OpenVINO, on Windows CPU/GPU — no Paddle framework required at inference time.
 
 ## What's included
 
