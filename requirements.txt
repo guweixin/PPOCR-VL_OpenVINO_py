@@ -3,8 +3,8 @@
 # Python 3.10+ recommended.
 
 # --- Inference (ppocr_vl_pipeline.py) ---
-openvino==2026.1.0
-openvino-tokenizers==2026.1.0.0   # loads tokenizer.xml/detokenizer.xml (replaces sentencepiece)
+openvino==2026.2.0
+openvino-tokenizers==2026.2.0.0   # loads tokenizer.xml/detokenizer.xml (replaces sentencepiece)
 numpy==2.4.4
 opencv-python==4.13.0.92
 pillow==12.2.0
@@ -14,10 +14,20 @@ PyYAML==6.0.3
 # (default --pipeline v3_vl15). The --pipeline v2_vl path does not need it.
 transformers==5.8.1
 
+# pypdfium2 is only needed for PDF input (--image points to a .pdf or a folder
+# containing PDFs). Image / multi-page TIFF inputs use Pillow + OpenCV (above).
+pypdfium2==4.30.0
+
 # torch is pulled in by transformers and used for VL pre/post-processing.
-# Install the build matching your platform/CUDA (the +cu130 wheel comes from
-# the PyTorch index, e.g. pip install torch --index-url https://download.pytorch.org/whl/cu130).
+# CPU build is enough for the OpenVINO pipeline (inference runs on OpenVINO):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# For a CUDA build use the matching index, e.g. .../whl/cu130.
 torch==2.12.0
+
+# torchvision is required by transformers' AutoImageProcessor, used by the
+# PP-DocLayoutV3 layout path (default --pipeline v3_vl15). Keep it matched to
+# the torch build/version above (install both from the same PyTorch index).
+torchvision==0.27.0
 
 # --- Model conversion only (convert_ppocr-vl_models.py) ---
 # Reuses openvino / openvino-tokenizers / transformers / torch / numpy above.

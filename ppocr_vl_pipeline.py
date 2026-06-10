@@ -68,15 +68,28 @@ def load_vl_runtime_config(model_dir: Path, tokenizer) -> dict:
     with open(model_dir / "added_tokens.json", "r", encoding="utf-8") as f:
         added_tokens = json.load(f)
 
-    # Read image normalization from preprocessor_config.json (falls back to VL-1.5 defaults)
+    # Read image normalization + the vision-encoder pixel budget from
+    # preprocessor_config.json (falls back to VL-1.5 defaults). Sourcing
+    # min/max_pixels from the model config keeps the pixel budget in lockstep
+    # with whatever model is loaded instead of a duplicated hard-coded value.
     preproc_path = model_dir / "preprocessor_config.json"
     image_mean = [0.5, 0.5, 0.5]
     image_std = [0.5, 0.5, 0.5]
+    min_pixels = VL_MIN_PIXELS
+    max_pixels = VL_MAX_PIXELS
+    resample = 3                  # PIL resampling filter id (3 == BICUBIC)
+    rescale_factor = 1.0 / 255.0
+    cfg_merge_size = 2
     if preproc_path.exists():
         with open(preproc_path, "r", encoding="utf-8") as f:
             preproc = json.load(f)
         image_mean = preproc.get("image_mean", image_mean)
         image_std = preproc.get("image_std", image_std)
+        min_pixels = int(preproc.get("min_pixels", min_pixels))
+        max_pixels = int(preproc.get("max_pixels", max_pixels))
+        resample = int(preproc.get("resample", resample))
+        rescale_factor = float(preproc.get("rescale_factor", rescale_factor))
+        cfg_merge_size = int(preproc.get("merge_size", cfg_merge_size))
 
     # BOS: try added_tokens.json, then tokenizer_config.json's added_tokens_decoder,
     # then fall back to 1. (tokenizer_config.json is already required by the
@@ -115,12 +128,16 @@ def load_vl_runtime_config(model_dir: Path, tokenizer) -> dict:
         "video_token_id": config["video_token_id"],
         "image_mean": image_mean,
         "image_std": image_std,
+        "min_pixels": min_pixels,
+        "max_pixels": max_pixels,
+        "resample": resample,
+        "rescale_factor": rescale_factor,
         "bos_chat": bos_chat,
         "user_prefix_ids": user_prefix_ids,
         "asst_suffix_ids": asst_suffix_ids,
         # Always use whole-image pipeline (patch-level removed)
         "is_patch_level": False,
-        "merge_size": 2,
+        "merge_size": cfg_merge_size,
     }
 
 
@@ -130,6 +147,42 @@ PROMPTS = {
     "formula": "Formula Recognition:",
     "chart": "Chart Recognition:",
 }
+
+# Fallback vision-encoder pixel budget. The real values are read at runtime from
+# each model's preprocessor_config.json (min_pixels/max_pixels); these defaults
+# are only used if that file is missing. Matching them is critical for small-text
+# accuracy: too small a min_pixels under-resolves line/cell crops and inflates CER.
+VL_MIN_PIXELS = 28 * 28 * 144   # 112896
+VL_MAX_PIXELS = 28 * 28 * 1280  # 1003520
+
+# Region crop padding before recognition. Official PaddleX uses CropByBoxes
+# (exact bbox, no expansion); keep this at 0 for parity. Increase only if the
+# layout detector boxes are observed to clip glyphs. Not present in any model
+# config — this is a pipeline design choice.
+CROP_PADDING = 0
+
+# Generation token ceiling. The OV models ship no generation_config.json; Paddle's
+# default is 4096. Also caps runaway / no-EOS regions so decoding always terminates.
+MAX_NEW_TOKENS = 4096
+
+# PP-DocLayoutV3 (DETR) score threshold. inference.yml ships draw_threshold=0.5,
+# but the detector emits valid boxes down to ~0.36, so we default lower to avoid
+# dropping them (matches observed Paddle output). Override via --layout-threshold.
+LAYOUT_V3_SCORE_THRESHOLD = 0.3
+
+# Box-dedup thresholds. PP-DocLayoutV3 is DETR and has no NMS in its config, so
+# these are pipeline heuristics (not read from the model).
+LAYOUT_NMS_IOU_THRESH = 0.5
+LAYOUT_NMS_IO_MIN_THRESH = 0.7
+
+# Anti-runaway greedy-decode guards (fp16 greedy can loop). These are loose
+# heuristics, NOT model config: stop on a long identical-token streak, or on an
+# n-gram repeated many times. Tuned to never truncate legitimately repeated
+# content (table rules, dotted leaders, repeated headers).
+REPEAT_SINGLE_TOKEN_WINDOW = 24  # this many identical consecutive tokens -> stop
+REPEAT_MIN_NGRAM = 2             # smallest repeated n-gram window to detect
+REPEAT_MAX_NGRAM = 60            # largest repeated n-gram window to detect
+REPEAT_MIN_COUNT = 4             # n-gram must repeat >= this many times to flag
 
 # --- Result Classes (Mimicking PaddleX) ---
 
@@ -391,6 +444,47 @@ class BaseResult(dict, JsonMixin, MarkdownMixin, ImgMixin):
         fp = self["input_path"]
         return Path(fp).name
 
+# Layout classes rendered as cropped <img> references (NOT transcribed via VL),
+# matching Paddle's default behaviour (use_chart_recognition=False crops charts).
+IMAGE_BLOCK_LABELS = {"image", "chart", "figure", "header_image", "footer_image"}
+
+# Cell delimiter the VL model emits per table cell. The OpenVINO detokenizer
+# renders this special token as the Unicode replacement char (U+FFFD).
+_TABLE_CELL_SEP = "\ufffd"
+_TABLE_ROW_SEP = "<nl>"
+
+
+def _vl_table_to_html(content: str) -> str:
+    """Convert the VL model's raw table stream into Paddle-style HTML.
+
+    The model emits one cell-separator token before each cell (decoded as
+    U+FFFD) and ``<nl>`` at the end of each row. Paddle post-processes the
+    same stream into ``<table><tr><td>...</td></tr></table>``; we mirror that
+    exact markup so OV output aligns with the reference.
+    """
+    raw = content.strip()
+    if _TABLE_CELL_SEP not in raw and _TABLE_ROW_SEP not in raw:
+        return content  # not a delimited table; leave content untouched
+    rows_html = []
+    for row in raw.split(_TABLE_ROW_SEP):
+        if _TABLE_CELL_SEP not in row and not row.strip():
+            continue
+        cells = row.split(_TABLE_CELL_SEP)
+        if cells and cells[0] == "":
+            cells = cells[1:]  # drop the empty field before the first delimiter
+        if not cells:
+            continue
+        tds = "".join(
+            f"<td style='text-align: center; word-wrap: break-word;'>{c.strip()}</td>"
+            for c in cells
+        )
+        rows_html.append(f"<tr>{tds}</tr>")
+    if not rows_html:
+        return content
+    return ("<table border=1 style='margin: auto; word-wrap: break-word;'>"
+            + "".join(rows_html) + "</table>")
+
+
 class OCRResult(BaseResult):
     def __init__(self, data: dict, original_img: Image.Image = None):
         super().__init__(data)
@@ -399,24 +493,43 @@ class OCRResult(BaseResult):
     def _to_markdown(self, pretty=True, show_formula_number=False) -> Dict[str, Union[str, Dict[str, Any]]]:
         markdown_text = ""
         images = {}
-        
+        page_w = self.original_img.size[0] if self.original_img is not None else 0
+
         parsing_res_list = self.get("parsing_res_list", [])
         for block in parsing_res_list:
             content = block["block_content"]
             label = block["block_label"]
             bbox = block["block_bbox"]
             block_id = block["block_id"]
-            
+
             if label == "figure_title" or label == "paragraph_title":
                 markdown_text += f"### {content}\n\n"
-            elif label == "image":
-                # Save crop image
-                crop_name = f"img_{block_id}.jpg"
+            elif label in IMAGE_BLOCK_LABELS:
+                # Crop the region and emit a centered <img> reference instead of
+                # transcribing it, matching Paddle's chart/figure/image output.
+                x1, y1, x2, y2 = bbox
+                crop_name = (
+                    f"img_in_{label}_box_"
+                    f"{int(x1)}_{int(y1)}_{int(x2)}_{int(y2)}.jpg"
+                )
                 images[f"imgs/{crop_name}"] = self._crop_image(bbox)
-                markdown_text += f"![{label}](imgs/{crop_name})\n\n"
+                if page_w:
+                    pct = max(1, round((x2 - x1) / page_w * 100))
+                    markdown_text += (
+                        f'<div style="text-align: center;">'
+                        f'<img src="imgs/{crop_name}" alt="Image" width="{pct}%" />'
+                        f"</div>\n\n"
+                    )
+                else:
+                    markdown_text += (
+                        f'<div style="text-align: center;">'
+                        f'<img src="imgs/{crop_name}" alt="Image" /></div>\n\n'
+                    )
+            elif label == "table":
+                markdown_text += _vl_table_to_html(content) + "\n\n"
             else:
                 markdown_text += f"{content}\n\n"
-                
+
         return {"markdown_texts": markdown_text, "images": images}
 
     def save_to_img(self, save_path=None):
@@ -497,7 +610,7 @@ class OCRResult(BaseResult):
             return self.original_img.crop((x1, y1, x2, y2))
         return Image.new('RGB', (100, 100), color='gray')
 
-def smart_resize(height: int, width: int, factor: int = 28, min_pixels: int = 28 * 28 * 16, max_pixels: int = 28 * 28 * 1280):
+def smart_resize(height: int, width: int, factor: int = 28, min_pixels: int = VL_MIN_PIXELS, max_pixels: int = VL_MAX_PIXELS):
     if height < factor:
         width = round((width * factor) / height)
         height = factor
@@ -518,16 +631,23 @@ def smart_resize(height: int, width: int, factor: int = 28, min_pixels: int = 28
         w_bar = math.ceil(width * beta / factor) * factor
     return h_bar, w_bar
 
-def _normalize_image(image: Image.Image, image_mean, image_std) -> np.ndarray:
-    arr = np.array(image).astype(np.float32) / 255.0
+def _normalize_image(image: Image.Image, image_mean, image_std,
+                     rescale_factor: float = 1.0 / 255.0) -> np.ndarray:
+    arr = np.array(image).astype(np.float32) * rescale_factor
     mean = np.array(image_mean, dtype=np.float32)
     std = np.array(image_std, dtype=np.float32)
     return (arr - mean) / std  # HWC
 
 
-def process_image(image_input, patch_size: int, image_mean=None, image_std=None):
+def process_image(image_input, patch_size: int, image_mean=None, image_std=None,
+                  min_pixels: int = VL_MIN_PIXELS, max_pixels: int = VL_MAX_PIXELS,
+                  merge_size: int = 2, resample: int = Image.BICUBIC,
+                  rescale_factor: float = 1.0 / 255.0):
     """VL v1 whole-image preprocessing.
     Returns pixel_values [1, 3, H, W], grid_thw (1, H//p, W//p).
+    min_pixels/max_pixels control the vision-encoder pixel budget and must match
+    the official preprocessor (VL_MIN_PIXELS/VL_MAX_PIXELS) for accuracy parity.
+    merge_size/resample/rescale_factor mirror preprocessor_config.json.
     """
     if isinstance(image_input, str):
         image = Image.open(image_input).convert("RGB")
@@ -537,15 +657,16 @@ def process_image(image_input, patch_size: int, image_mean=None, image_std=None)
         raise ValueError("image_input must be a file path or PIL Image object")
 
     w, h = image.size
-    new_h, new_w = smart_resize(h, w)
-    image = image.resize((new_w, new_h), Image.BICUBIC)
+    factor = patch_size * merge_size  # vision encoder merges merge_size×merge_size patches
+    new_h, new_w = smart_resize(h, w, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
+    image = image.resize((new_w, new_h), resample)
 
     if image_mean is None:
         image_mean = [0.48145466, 0.4578275, 0.40821073]  # VL v1: CLIP norm
     if image_std is None:
         image_std = [0.26862954, 0.26130258, 0.27577711]
 
-    image_np = _normalize_image(image, image_mean, image_std).transpose(2, 0, 1)
+    image_np = _normalize_image(image, image_mean, image_std, rescale_factor).transpose(2, 0, 1)
     return torch.tensor(image_np).unsqueeze(0), (1, new_h // patch_size, new_w // patch_size)
 
 
@@ -816,6 +937,12 @@ class PaddleOCRVLPipeline:
         self.spatial_merge_size = self.vl["spatial_merge_size"]
         self.image_mean = self.vl["image_mean"]
         self.image_std = self.vl["image_std"]
+        # Vision-encoder pixel budget + resize/rescale params from preprocessor_config.json.
+        self.min_pixels = self.vl["min_pixels"]
+        self.max_pixels = self.vl["max_pixels"]
+        self.resample = self.vl["resample"]
+        self.rescale_factor = self.vl["rescale_factor"]
+        self.merge_size = self.vl["merge_size"]
         n_dec_in = len(self.text_decoder.inputs)
         self._is_stateful = (n_dec_in == 3)
         self._decode_debug = os.environ.get("PPOCR_DECODE_DEBUG", "0") == "1"
@@ -879,13 +1006,22 @@ class PaddleOCRVLPipeline:
         if self._merged_vision:
             return self._encode_image_merged(pixel_values, grid_thw)
         return self._encode_image_v1(pixel_values, grid_thw)
-    def generate(self, image_path, task="ocr"):
+    def generate(self, image_path, task="ocr", min_pixels: int = None,
+                 max_pixels: int = None):
+        # Default to the per-model pixel budget read from preprocessor_config.json.
+        if min_pixels is None:
+            min_pixels = self.min_pixels
+        if max_pixels is None:
+            max_pixels = self.max_pixels
         prompt = PROMPTS[task]
         cfg = self.vl["config"]
         # 1. Process Image (whole-image path for both VL v1 and VL-1.5)
         pixel_values, grid_thw = process_image(
             image_path, self.patch_size,
             image_mean=self.image_mean, image_std=self.image_std,
+            min_pixels=min_pixels, max_pixels=max_pixels,
+            merge_size=self.spatial_merge_size,
+            resample=self.resample, rescale_factor=self.rescale_factor,
         )
         image_embeds = self.encode_image(pixel_values, grid_thw=grid_thw)
         image_grid_thw = grid_thw
@@ -958,19 +1094,23 @@ class PaddleOCRVLPipeline:
         # Timing accumulators (only reported when PPOCR_DECODE_DEBUG=1)
         t_prefill = 0.0; t_decode = 0.0; t_lmhead = 0.0; t_embed = 0.0
 
-        # Per-task token limits
-        _TASK_MAX_TOKENS = {
-            "ocr": 768,
-            "table": 1024,
-            "formula": 256,
-            "chart": 512,
-        }
-        max_new_tokens = _TASK_MAX_TOKENS.get(task, 512)
-        _SINGLE_WIN = 6  # identical single-token streak
+        # Per-task token ceiling. Official PaddleOCR-VL uses max_new_tokens=4096
+        # for all tasks and relies on EOS to stop early; smaller caps truncate
+        # long paragraphs/tables and inflate CER. We keep 4096 as a safety
+        # ceiling (the repetition guards below stop degenerate loops well before).
+        max_new_tokens = MAX_NEW_TOKENS
+        # Anti-runaway guards only. The official decoder has NO anti-repetition
+        # (pure greedy + EOS), so these must be loose enough to never truncate
+        # legitimately repeated content (table rules, dotted leaders, repeated
+        # headers); they exist only to cap pathological fp16 greedy loops.
+        _SINGLE_WIN = REPEAT_SINGLE_TOKEN_WINDOW  # break only on a long identical-token streak
 
-        def _is_repeating(ids: list, min_win: int = 2, max_win: int = 60,
-                           min_reps: int = 2) -> bool:
-            """Return True if the tail of `ids` contains a repeated n-gram."""
+        def _is_repeating(ids: list, min_win: int = REPEAT_MIN_NGRAM,
+                           max_win: int = REPEAT_MAX_NGRAM,
+                           min_reps: int = REPEAT_MIN_COUNT) -> bool:
+            """Return True only if the tail is a clearly degenerate loop: the same
+            n-gram repeated >= min_reps times (raised from 2 to 4 so short, valid
+            repeats like "no no no" are not flagged)."""
             n = len(ids)
             for win in range(min_win, min(max_win + 1, n // min_reps + 1)):
                 need = win * min_reps
@@ -1033,18 +1173,22 @@ class PaddleOCRVLPipeline:
             if len(generated_ids) >= _SINGLE_WIN and len(set(generated_ids[-_SINGLE_WIN:])) == 1:
                 break
 
-            # Repetition guard 2: repeated n-gram of any length 2–60
+            # Repetition guard 2: clearly degenerate repeated n-gram (>=4 reps)
             if _is_repeating(generated_ids):
-                # trim to first occurrence of the repeated block
+                # Collapse the trailing repeated block down to a single copy so
+                # one legitimate instance survives, then stop.
                 n = len(generated_ids)
-                for win in range(2, min(61, n // 2 + 1)):
+                for win in range(REPEAT_MIN_NGRAM, min(REPEAT_MAX_NGRAM + 1, n // 2 + 1)):
                     need = win * 2
                     if n >= need:
                         tail = generated_ids[-need:]
                         ngram = tuple(tail[:win])
                         if all(tuple(tail[j: j + win]) == ngram
                                for j in range(0, need, win)):
-                            generated_ids = generated_ids[:-win]
+                            # Drop every trailing duplicate copy of `ngram`.
+                            while (len(generated_ids) >= 2 * win and
+                                   generated_ids[-win:] == generated_ids[-2 * win:-win]):
+                                generated_ids = generated_ids[:-win]
                             break
                 break
 
@@ -1211,7 +1355,7 @@ class PPDocLayoutV3Pipeline:
             layout_cfg = json.load(f)
         self.id2label = {int(k): v for k, v in layout_cfg.get("id2label", {}).items()}
         # Use 0.3 to match Paddle's detection threshold (Paddle outputs boxes ~0.36+)
-        self.draw_threshold = 0.3
+        self.draw_threshold = LAYOUT_V3_SCORE_THRESHOLD
 
         self._image_processor = None
         try:
@@ -1292,8 +1436,14 @@ class PPDocLayoutV3Pipeline:
                 }
             )
 
-        # Cross-class NMS: remove lower-score boxes that heavily overlap a higher-score box
-        return _layout_nms(boxes, iou_thresh=0.5, io_min_thresh=0.7), img_bgr
+        # Containment-aware overlap filtering. The layout model sometimes emits a
+        # large box covering several lines AND the individual line boxes; without
+        # this the output duplicates that text and inflates CER/WER. Layout boxes
+        # do not nest legitimately (a table is a single box, cells are handled
+        # inside table recognition), so dropping heavily-contained lower-score
+        # boxes mirrors the official filter_overlap_boxes behavior.
+        return _layout_nms(boxes, iou_thresh=LAYOUT_NMS_IOU_THRESH,
+                           io_min_thresh=LAYOUT_NMS_IO_MIN_THRESH), img_bgr
 
     def label_name(self, class_id: int) -> str:
         return self.id2label.get(class_id, f"Class_{class_id}")
@@ -1336,6 +1486,135 @@ def build_pipelines(
     return layout, ocr, preset
 
 
+# ── Input formats (parity with PaddleX ImageBatchSampler) ──────────────────
+# Matches paddlex/inference/common/batch_sampler/image_batch_sampler.py:
+#   single images, multi-page TIFF, PDF, directory (recursive), URL.
+TIFF_SUFFIX = ("tiff", "tif")
+IMG_SUFFIX = (
+    "bmp", "dib",
+    "jpeg", "jpg",
+    "png",
+    "webp",
+    "pbm", "pgm", "ppm", "pnm",
+    "sr", "ras",
+) + TIFF_SUFFIX
+PDF_SUFFIX = ("pdf",)
+# Render scale for PDF pages; mirrors PaddleX default zoom (PDF_RENDER_SCALE=2.0).
+PDF_RENDER_SCALE = 2.0
+
+
+def _is_url(s) -> bool:
+    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+
+
+def _download_to_cache(url: str) -> Path:
+    """Download a remote image/PDF to a local cache dir (parity with URL input)."""
+    import urllib.request
+
+    cache_dir = WORKING_DIR / ".input_cache"
+    cache_dir.mkdir(exist_ok=True)
+    fname = Path(url.split("?")[0]).name or "download"
+    dst = cache_dir / fname
+    req = urllib.request.Request(url, headers={"User-Agent": "ppocr-vl"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dst, "wb") as f:
+        f.write(resp.read())
+    return dst
+
+
+def _read_pdf_pages(path: Path):
+    """Yield (page_index, BGR ndarray) for each PDF page via pypdfium2."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:  # pragma: no cover - surfaced clearly at runtime
+        raise RuntimeError(
+            "Reading PDF input requires `pypdfium2`. Install it with "
+            "`pip install pypdfium2`."
+        ) from exc
+
+    pdf = pdfium.PdfDocument(str(path))
+    try:
+        for i in range(len(pdf)):
+            page = pdf[i]
+            try:
+                bitmap = page.render(scale=PDF_RENDER_SCALE)
+                pil = bitmap.to_pil().convert("RGB")
+            finally:
+                page.close()
+            yield i, cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    finally:
+        pdf.close()
+
+
+def _read_tiff_pages(path: Path):
+    """Yield (page_index, BGR ndarray) for each TIFF frame via Pillow."""
+    img = Image.open(str(path))
+    n_frames = getattr(img, "n_frames", 1)
+    for i in range(n_frames):
+        img.seek(i)
+        frame = img.convert("RGB")
+        yield i, cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
+
+
+def _gather_files(directory: Path):
+    """Recursively collect supported files from a directory (parity with os.walk)."""
+    allowed = set(IMG_SUFFIX) | set(PDF_SUFFIX)
+    files = []
+    for root, _dirs, names in os.walk(directory):
+        for name in names:
+            if name.rsplit(".", 1)[-1].lower() in allowed:
+                files.append(Path(root) / name)
+    return sorted(files)
+
+
+def iter_input_items(raw_input):
+    """Expand a CLI input into per-page work items.
+
+    Yields ``(image_for_proc, out_stem, page_index, label)`` where
+    ``image_for_proc`` is either a file path (regular single images, read by
+    cv2.imread like the official OpenCV backend) or a BGR numpy array
+    (rendered PDF / TIFF pages). Mirrors the input formats supported by
+    PaddleX ``ImageBatchSampler``: images, multi-page TIFF, PDF, directory
+    (recursive) and URL.
+    """
+    if _is_url(raw_input):
+        raw_input = str(_download_to_cache(raw_input))
+
+    p = Path(raw_input)
+    if p.is_dir():
+        files = _gather_files(p)
+        if not files:
+            raise FileNotFoundError(f"No supported files found in directory: {p}")
+        for f in files:
+            yield from iter_input_items(str(f))
+        return
+    if not p.is_file():
+        raise FileNotFoundError(f"Path not found: {raw_input}")
+
+    suffix = p.suffix.lower().lstrip(".")
+    stem = p.stem
+    if suffix in PDF_SUFFIX:
+        pages = list(_read_pdf_pages(p))
+        multi = len(pages) > 1
+        for idx, arr in pages:
+            out_stem = f"{stem}_page{idx}" if multi else stem
+            label = f"{p.name} (page {idx + 1}/{len(pages)})"
+            yield arr, out_stem, idx, label
+    elif suffix in TIFF_SUFFIX:
+        pages = list(_read_tiff_pages(p))
+        multi = len(pages) > 1
+        for idx, arr in pages:
+            out_stem = f"{stem}_page{idx}" if multi else stem
+            label = f"{p.name} (frame {idx + 1}/{len(pages)})" if multi else p.name
+            yield arr, out_stem, (idx if multi else None), label
+    elif suffix in IMG_SUFFIX:
+        yield str(p), stem, None, p.name
+    else:
+        allowed = ", ".join(sorted(set(IMG_SUFFIX) | set(PDF_SUFFIX)))
+        raise ValueError(
+            f"Unsupported input file type: `{p.name}`. Supported suffixes: {allowed}"
+        )
+
+
 def run_end_to_end(
     image_path: Path,
     pipeline_name: str = DEFAULT_PIPELINE,
@@ -1347,6 +1626,10 @@ def run_end_to_end(
     # Pre-built pipelines; if provided, model loading is skipped
     layout_pipeline=None,
     ocr_pipeline=None,
+    # Output naming / metadata (used for multi-page PDF/TIFF so pages don't
+    # overwrite each other). When out_stem is None it is derived from image_path.
+    out_stem: str = None,
+    page_index: int = None,
 ):
     preset = PIPELINE_PRESETS[pipeline_name]
     if layout_pipeline is None or ocr_pipeline is None:
@@ -1366,8 +1649,17 @@ def run_end_to_end(
         # Still apply threshold override when reusing pipelines
         if layout_threshold is not None:
             layout_pipeline.draw_threshold = layout_threshold
+    # Stem used for output filenames + JSON metadata. For in-memory pages
+    # (PDF/TIFF) out_stem carries a per-page name so results don't collide.
+    if out_stem is not None:
+        display_stem = out_stem
+    elif isinstance(image_path, (str, Path)):
+        display_stem = Path(str(image_path)).stem or "vis_layout"
+    else:
+        display_stem = "vis_layout"
+
     if debug:
-        print(f"\n=== Processing Image: {image_path.name if hasattr(image_path, 'name') else image_path} ===")
+        print(f"\n=== Processing Image: {display_stem} ===")
     
     total_start_time = time.time()
     
@@ -1375,6 +1667,8 @@ def run_end_to_end(
     img_load_start = time.time()
     if isinstance(image_path, (str, Path)):
         original_img_cv2 = cv2.imread(str(image_path))
+        if original_img_cv2 is None:
+            raise ValueError(f"Failed to read image: {image_path}")
     else:
         original_img_cv2 = image_path
     img_load_end = time.time()
@@ -1417,10 +1711,10 @@ def run_end_to_end(
             print(f"Box: {bbox}")
         
         # Crop
-        # Ensure coordinates are within bounds
+        # Ensure coordinates are within bounds. Official PaddleX crops the exact
+        # bbox (CropByBoxes); CROP_PADDING defaults to 0 for parity.
         w, h = original_img_pil.size
-        # Add padding to avoid cutting off characters at edges
-        padding = 5
+        padding = CROP_PADDING
         x1 = max(0, int(bbox[0]) - padding)
         y1 = max(0, int(bbox[1]) - padding)
         x2 = min(w, int(bbox[2]) + padding)
@@ -1433,7 +1727,9 @@ def run_end_to_end(
             
         crop_img = original_img_pil.crop((x1, y1, x2, y2))
         
-        SKIP_CLASSES = {"image", "figure", "figure_caption", "header_image", "footer_image"}
+        # Charts are skipped from VL recognition and emitted as cropped images,
+        # matching Paddle's default (use_chart_recognition=False).
+        SKIP_CLASSES = {"image", "chart", "figure", "figure_caption", "header_image", "footer_image"}
         if class_name in SKIP_CLASSES:
             if debug:
                 print(f"Detection class_name:{class_name}, skipping VL recognition")
@@ -1449,8 +1745,6 @@ def run_end_to_end(
         task = "ocr"
         if class_name == "table":
             task = "table"
-        elif class_name == "chart":
-            task = "chart"
         elif class_name in ("display_formula", "inline_formula", "formula"):
             task = "formula"
 
@@ -1488,8 +1782,8 @@ def run_end_to_end(
     
     # Save Results using OCRResult class
     ocr_result = OCRResult({
-        "input_path": str(image_path),
-        "page_index": None,
+        "input_path": display_stem if out_stem is not None else str(image_path),
+        "page_index": page_index,
         "model_settings": {
             "use_doc_preprocessor": False,
             "use_layout_detection": True,
@@ -1526,7 +1820,7 @@ def run_end_to_end(
     
     # Save save_to_img (Visualization of layout) — per-image name so results
     # for a folder don't overwrite each other.
-    vis_stem = Path(str(image_path)).stem or "vis_layout"
+    vis_stem = display_stem
     ocr_result.save_to_img(save_path=str(output_dir / f"{vis_stem}_vis_layout.jpg"))
     if debug:
         print(f"Saved detection result to {output_dir}")
@@ -1537,8 +1831,6 @@ def run_end_to_end(
 def main():
     import argparse
 
-    SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
-
     parser = argparse.ArgumentParser(description="PaddleOCR-VL OpenVINO end-to-end pipeline")
     parser.add_argument(
         "--pipeline",
@@ -1548,9 +1840,13 @@ def main():
     )
     parser.add_argument(
         "--image",
-        type=Path,
-        default=WORKING_DIR / "test.png",
-        help="Input image path or folder",
+        type=str,
+        default=str(WORKING_DIR / "test.png"),
+        help=(
+            "Input source: image file, multi-page TIFF, PDF, a directory "
+            "(searched recursively) or an http(s) URL. Supported image "
+            "suffixes: " + ", ".join(sorted(set(IMG_SUFFIX) | set(PDF_SUFFIX)))
+        ),
     )
     parser.add_argument(
         "--ov-root",
@@ -1579,23 +1875,17 @@ def main():
     )
     args = parser.parse_args()
 
-    input_path = args.image.resolve()
-
-    # Collect image files
-    if input_path.is_dir():
-        image_files = sorted(
-            p for p in input_path.iterdir()
-            if p.suffix.lower() in SUPPORTED_EXTS
-        )
-        if not image_files:
-            print(f"No supported images found in {input_path}")
-            return
-        print(f"Found {len(image_files)} image(s) in {input_path}")
-    elif input_path.is_file():
-        image_files = [input_path]
-    else:
-        print(f"Path not found: {input_path}")
+    # Expand the input into per-page work items: images / multi-page TIFF /
+    # PDF / directory (recursive) / URL — same formats as the official pipeline.
+    try:
+        items = list(iter_input_items(args.image))
+    except Exception as exc:
+        print(f"Failed to read input '{args.image}': {exc}")
         return
+    if not items:
+        print(f"No supported input found: {args.image}")
+        return
+    print(f"Collected {len(items)} page(s)/image(s) from {args.image}")
 
     # ── Load models ONCE before the loop ────────────────────────────────────
     preset = PIPELINE_PRESETS[args.pipeline]
@@ -1621,12 +1911,12 @@ def main():
     per_image_times = []
     failed = []
 
-    for idx, img_path in enumerate(image_files):
+    for idx, (img_for_proc, out_stem, page_index, label) in enumerate(items):
         print(f"\n{'='*60}")
-        print(f"[{idx+1}/{len(image_files)}] {img_path.name}")
+        print(f"[{idx+1}/{len(items)}] {label}")
         try:
             _, img_time = run_end_to_end(
-                image_path=img_path,
+                image_path=img_for_proc,
                 pipeline_name=args.pipeline,
                 ov_root=ov_root,
                 device=args.device,
@@ -1635,17 +1925,19 @@ def main():
                 debug=bool(args.debug),
                 layout_pipeline=layout_pipeline,
                 ocr_pipeline=ocr_pipeline,
+                out_stem=out_stem,
+                page_index=page_index,
             )
-            per_image_times.append((img_path.name, img_time))
+            per_image_times.append((label, img_time))
         except Exception as exc:
             print(f"  FAILED: {exc}")
-            failed.append((img_path.name, str(exc)))
+            failed.append((label, str(exc)))
 
     total_wall = time.time() - all_start
     inference_total = sum(t for _, t in per_image_times)
 
     # ── Summary ──────────────────────────────────────────────────────────────
-    n = len(image_files)
+    n = len(items)
     print(f"\n{'='*60}")
     print(f"SUMMARY  ({len(per_image_times)}/{n} succeeded, {len(failed)} failed)")
     print(f"  Model load time : {model_load_time:.2f}s")

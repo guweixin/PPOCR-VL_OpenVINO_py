@@ -1,4 +1,4 @@
-﻿"""
+"""
 一键转换 PP-OCR-models 下 VL 模型到 OpenVINO 格式，保存到 PP-OCR-OV-models。
 包含 OV Tokenizer / Detokenizer 转换。
 
@@ -719,10 +719,14 @@ def main():
         print(f"⚠ 未知 precision='{precision}'，回退为 {DEFAULT_PRECISION}")
         precision = DEFAULT_PRECISION
 
-    # Legacy explicit-KV decoder is the default — it's faster for short OCR
-    # outputs. --stateful exports the on-device-KV variant, which only pays off
-    # for very long sequences (large tables / full pages).
-    stateful = "--stateful" in sys.argv
+    # Stateful (on-device KV) decoder is now the default: it eliminates the
+    # O(n^2) host-side KV-cache copies of the legacy explicit-KV export and is
+    # faster for the long sequences this pipeline produces (max_new_tokens=4096,
+    # full paragraphs / large tables). The MakeStateful transform is topology
+    # only (applied before weight compression), so precision is unchanged.
+    # Pass --legacy-decoder to fall back to the explicit-KV variant; --stateful
+    # is still accepted for backwards compatibility.
+    stateful = "--legacy-decoder" not in sys.argv
 
     # --int8-decoder: int8 weight-only on text_decoder + lm_head ONLY (the weights
     # re-read every token). Vision + text_embed stay at --precision. This is the
@@ -733,7 +737,7 @@ def main():
     print(f"skip_existing={skip_existing}  (--force 强制重转)")
     print(f"weight precision = {precision}  (--precision fp32|fp16)")
     print(f"decoder/lm_head precision = {decoder_precision}  (--int8-decoder 开启 int8)")
-    print(f"stateful decoder = {stateful}  (--stateful 开启; 默认 legacy，短文本更快)")
+    print(f"stateful decoder = {stateful}  (默认 stateful；--legacy-decoder 回退显式 KV)")
 
     if not only_v15:
         convert_vl_model(
