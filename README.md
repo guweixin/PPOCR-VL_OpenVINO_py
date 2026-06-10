@@ -26,6 +26,22 @@ Run PaddleOCR-VL document parsing pipelines entirely with OpenVINO, on Windows C
 
 ---
 
+## Supported input formats
+
+`--image` accepts a single file, a **directory** (searched recursively), or an `http(s)` URL.
+
+| Category          | Extensions                                                                          |
+| ----------------- | ----------------------------------------------------------------------------------- |
+| Raster images     | `.bmp` `.dib` `.jpeg` `.jpg` `.png` `.webp` `.pbm` `.pgm` `.ppm` `.pnm` `.sr` `.ras` |
+| Multi-page images | `.tiff` `.tif` — every frame is processed                                           |
+| Documents         | `.pdf` — every page is rendered at 2× (`PDF_RENDER_SCALE`) and processed             |
+
+15 file extensions in total. Multi-page TIFF and PDF inputs emit **one result per
+page/frame**. PDF support requires `pypdfium2` (already in the `ppocr-vl-infer` env).
+Any other extension raises a clear error listing the accepted suffixes.
+
+---
+
 ## Directory layout
 
 ```
